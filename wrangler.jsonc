@@ -2,5 +2,19 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "randomtalk-app",
   "main": "src/index.js",
-  "compatibility_date": "2026-08-12"
+  "compatibility_date": "2026-08-12",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CHAT",
+        "class_name": "ChatRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["ChatRoom"]
+    }
+  ]
 }
