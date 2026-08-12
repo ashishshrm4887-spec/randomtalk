@@ -1,416 +1,897 @@
 export default {
   async fetch(request, env) {
-    const html = `<!DOCTYPE html>
+    return new Response(`<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RandomTalk</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RandomTalk</title>
 
-  <style>
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
+<style>
+* {
+  box-sizing: border-box;
+}
 
-    body {
-      font-family: Arial, sans-serif;
-      background: #0b1020;
-      color: white;
-      min-height: 100vh;
-    }
+html {
+  scroll-behavior: smooth;
+}
 
-    .app {
-      max-width: 900px;
-      margin: auto;
-      min-height: 100vh;
-      padding: 20px;
-    }
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 80% 20%, rgba(124,58,237,.18), transparent 30%),
+    radial-gradient(circle at 20% 80%, rgba(217,70,239,.12), transparent 30%),
+    #050816;
+  color: #f8fafc;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
 
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 10px 0 25px;
-    }
+button,
+input {
+  font: inherit;
+}
 
-    .logo {
-      font-size: 28px;
-      font-weight: 800;
-    }
+button {
+  cursor: pointer;
+}
 
-    .status {
-      font-size: 13px;
-      padding: 8px 12px;
-      border-radius: 20px;
-      background: #172033;
-      color: #8df5b2;
-    }
+.container {
+  width: min(1180px, calc(100% - 32px));
+  margin: auto;
+}
 
-    .hero {
-      text-align: center;
-      padding: 35px 10px 25px;
-    }
+/* NAVBAR */
 
-    .hero h1 {
-      font-size: clamp(35px, 8vw, 65px);
-      margin-bottom: 12px;
-    }
+.navbar {
+  height: 82px;
+  border-bottom: 1px solid rgba(148,163,184,.12);
+  display: flex;
+  align-items: center;
+}
 
-    .hero p {
-      color: #aeb8cc;
-      font-size: 17px;
-    }
+.nav-inner {
+  width: min(1180px, calc(100% - 32px));
+  margin: auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
 
-    .card {
-      background: #121a2d;
-      border: 1px solid #25304a;
-      border-radius: 24px;
-      padding: 22px;
-      margin-top: 25px;
-    }
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 25px;
+  font-weight: 800;
+}
 
-    .mode-buttons {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin-bottom: 20px;
-    }
+.logo-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 13px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg,#a855f7,#6366f1);
+  box-shadow: 0 0 30px rgba(168,85,247,.35);
+}
 
-    button {
-      border: none;
-      cursor: pointer;
-      color: white;
-      font-size: 16px;
-      font-weight: 700;
-      border-radius: 14px;
-      padding: 15px;
-    }
+.logo span {
+  background: linear-gradient(90deg,#a855f7,#6366f1);
+  -webkit-background-clip: text;
+  color: transparent;
+}
 
-    .mode {
-      background: #1a243b;
-      border: 1px solid #303c58;
-    }
+.nav-links {
+  display: flex;
+  gap: 38px;
+}
 
-    .mode.active {
-      background: #5b5cf0;
-      border-color: #6b6cf5;
-    }
+.nav-links a {
+  color: #dbe3f1;
+  text-decoration: none;
+  font-weight: 600;
+}
 
-    .video-area {
-      height: 360px;
-      background: #080c16;
-      border-radius: 18px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      text-align: center;
-      overflow: hidden;
-      position: relative;
-    }
+.nav-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
 
-    .video-placeholder {
-      color: #77829a;
-    }
+.language,
+.profile {
+  border: 1px solid #26324b;
+  background: rgba(15,23,42,.7);
+  color: white;
+}
 
-    .video-icon {
-      font-size: 55px;
-      margin-bottom: 12px;
-    }
+.language {
+  padding: 11px 18px;
+  border-radius: 25px;
+}
 
-    .chat-area {
-      display: none;
-    }
+.profile {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+}
 
-    .chat-messages {
-      height: 300px;
-      overflow-y: auto;
-      background: #080c16;
-      border-radius: 18px;
-      padding: 15px;
-      margin-bottom: 12px;
-    }
+/* HERO */
 
-    .message {
-      background: #1b2740;
-      padding: 10px 13px;
-      border-radius: 14px;
-      margin-bottom: 9px;
-      width: fit-content;
-      max-width: 85%;
-    }
+.hero {
+  padding: 80px 0 55px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 55px;
+  align-items: center;
+}
 
-    .message.you {
-      background: #5b5cf0;
-      margin-left: auto;
-    }
+.hero h1 {
+  margin: 0;
+  font-size: clamp(48px,6vw,76px);
+  line-height: 1.02;
+  letter-spacing: -3px;
+}
 
-    .message-input {
-      display: flex;
-      gap: 10px;
-    }
+.gradient-text {
+  background: linear-gradient(90deg,#d946ef,#7c3aed,#6366f1);
+  -webkit-background-clip: text;
+  color: transparent;
+}
 
-    input {
-      flex: 1;
-      min-width: 0;
-      background: #080c16;
-      border: 1px solid #303c58;
-      color: white;
-      border-radius: 14px;
-      padding: 15px;
-      font-size: 16px;
-      outline: none;
-    }
+.hero p {
+  color: #aab5ca;
+  font-size: 21px;
+  line-height: 1.6;
+  max-width: 570px;
+}
 
-    .send {
-      background: #5b5cf0;
-    }
+.stats {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 25px 0;
+}
 
-    .actions {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin-top: 18px;
-    }
+.stat {
+  background: rgba(15,23,42,.75);
+  border: 1px solid #1d2942;
+  border-radius: 12px;
+  padding: 11px 15px;
+  color: #dce4f3;
+}
 
-    .start {
-      background: #18b96b;
-    }
+.online-dot {
+  color: #4ade80;
+}
 
-    .next {
-      background: #e05252;
-    }
+.hero-buttons {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
 
-    .info {
-      text-align: center;
-      color: #7f8ba3;
-      font-size: 13px;
-      margin-top: 20px;
-    }
+.primary-btn,
+.secondary-btn {
+  padding: 16px 25px;
+  border-radius: 14px;
+  font-weight: 800;
+  border: 1px solid transparent;
+}
 
-    footer {
-      text-align: center;
-      color: #647089;
-      padding: 30px 0;
-      font-size: 13px;
-    }
+.primary-btn {
+  color: white;
+  background: linear-gradient(90deg,#d946ef,#7c3aed);
+  box-shadow: 0 10px 35px rgba(124,58,237,.3);
+}
 
-    @media (max-width: 600px) {
-      .app {
-        padding: 15px;
-      }
+.secondary-btn {
+  background: transparent;
+  border-color: #34415d;
+  color: white;
+}
 
-      .video-area {
-        height: 300px;
-      }
+/* HERO VISUAL */
 
-      .actions {
-        grid-template-columns: 1fr;
-      }
-    }
-  </style>
+.hero-visual {
+  min-height: 380px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.orbit {
+  width: 250px;
+  height: 250px;
+  border: 1px dashed #8b5cf6;
+  border-radius: 50%;
+  position: absolute;
+  box-shadow: 0 0 60px rgba(124,58,237,.15);
+}
+
+.orbit-center {
+  width: 90px;
+  height: 90px;
+  border-radius: 50%;
+  background: linear-gradient(135deg,#7c3aed,#c026d3);
+  display: grid;
+  place-items: center;
+  font-size: 38px;
+  box-shadow: 0 0 60px rgba(168,85,247,.55);
+}
+
+.person-card {
+  width: 155px;
+  padding: 12px;
+  border: 1px solid #7652e8;
+  background: rgba(15,23,42,.92);
+  border-radius: 22px;
+  position: absolute;
+  box-shadow: 0 20px 50px rgba(0,0,0,.4);
+}
+
+.person-card.left {
+  left: 5%;
+  transform: rotate(-8deg);
+}
+
+.person-card.right {
+  right: 5%;
+  transform: rotate(8deg);
+}
+
+.avatar {
+  height: 140px;
+  border-radius: 15px;
+  background: linear-gradient(135deg,#312e81,#581c87);
+  display: grid;
+  place-items: center;
+  font-size: 65px;
+}
+
+.person-info {
+  padding: 10px 3px 3px;
+  line-height: 1.5;
+}
+
+/* CHAT AREA */
+
+.chat-app {
+  border: 1px solid #25304a;
+  background: rgba(8,15,32,.85);
+  border-radius: 25px;
+  overflow: hidden;
+  box-shadow: 0 30px 90px rgba(0,0,0,.35);
+  margin-bottom: 80px;
+}
+
+.chat-tabs {
+  padding: 18px;
+  border-bottom: 1px solid #202b42;
+  display: flex;
+  gap: 10px;
+}
+
+.tab {
+  flex: 1;
+  padding: 15px;
+  border-radius: 14px;
+  border: 1px solid #26324b;
+  background: transparent;
+  color: #aeb9ce;
+  font-weight: 800;
+}
+
+.tab.active {
+  color: white;
+  background: linear-gradient(90deg,#a855f7,#6366f1);
+  border-color: transparent;
+}
+
+.chat-layout {
+  display: grid;
+  grid-template-columns: 270px 1fr;
+}
+
+.sidebar {
+  padding: 22px;
+  border-right: 1px solid #202b42;
+}
+
+.sidebar h3 {
+  margin-top: 0;
+}
+
+.preference {
+  margin: 20px 0;
+}
+
+.preference-title {
+  color: #aab5ca;
+  margin-bottom: 10px;
+}
+
+.preference-buttons {
+  display: flex;
+}
+
+.preference-buttons button {
+  flex: 1;
+  padding: 11px;
+  background: #111a2d;
+  border: 1px solid #27334d;
+  color: white;
+}
+
+.preference-buttons button:first-child {
+  border-radius: 10px 0 0 10px;
+}
+
+.preference-buttons button:last-child {
+  border-radius: 0 10px 10px 0;
+}
+
+.preference-buttons .selected {
+  background: #7c3aed;
+}
+
+.select-box {
+  width: 100%;
+  padding: 13px;
+  border-radius: 10px;
+  background: #111a2d;
+  border: 1px solid #27334d;
+  color: white;
+}
+
+.save-btn {
+  width: 100%;
+  margin-top: 10px;
+  padding: 13px;
+  border: 0;
+  border-radius: 11px;
+  color: white;
+  font-weight: 800;
+  background: linear-gradient(90deg,#c026d3,#7c3aed);
+}
+
+.tips {
+  margin-top: 35px;
+  color: #aab5ca;
+  line-height: 1.9;
+}
+
+/* CHAT */
+
+.chat-panel {
+  min-height: 620px;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-header {
+  padding: 20px 25px;
+  border-bottom: 1px solid #202b42;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.connected {
+  color: #4ade80;
+  font-weight: 800;
+}
+
+.report {
+  border: 1px solid #6b2737;
+  background: transparent;
+  color: #fb7185;
+  padding: 9px 15px;
+  border-radius: 20px;
+}
+
+.messages {
+  flex: 1;
+  padding: 25px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.message {
+  max-width: 70%;
+  padding: 13px 17px;
+  border-radius: 17px;
+  line-height: 1.45;
+}
+
+.received {
+  align-self: flex-start;
+  background: #182238;
+  color: #e2e8f0;
+}
+
+.sent {
+  align-self: flex-end;
+  background: linear-gradient(135deg,#6d28d9,#4f46e5);
+}
+
+.message small {
+  display: block;
+  opacity: .6;
+  margin-top: 4px;
+  font-size: 11px;
+}
+
+.message-input {
+  margin: 0 25px 20px;
+  display: flex;
+  gap: 10px;
+}
+
+.message-input input {
+  flex: 1;
+  padding: 16px;
+  border-radius: 28px;
+  background: #0c1426;
+  border: 1px solid #34415d;
+  color: white;
+  outline: none;
+}
+
+.send-btn {
+  width: 55px;
+  height: 55px;
+  border-radius: 50%;
+  border: 0;
+  color: white;
+  background: linear-gradient(135deg,#d946ef,#7c3aed);
+}
+
+.chat-actions {
+  padding: 20px;
+  border-top: 1px solid #202b42;
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 15px;
+}
+
+.end-btn,
+.next-btn {
+  padding: 16px;
+  border-radius: 13px;
+  font-weight: 800;
+}
+
+.end-btn {
+  color: #fb7185;
+  background: #0b1222;
+  border: 1px solid #202b42;
+}
+
+.next-btn {
+  color: white;
+  border: 0;
+  background: linear-gradient(90deg,#d946ef,#7c3aed);
+}
+
+/* FOOTER */
+
+.footer {
+  text-align: center;
+  color: #64748b;
+  padding: 20px 0 50px;
+}
+
+/* MOBILE */
+
+@media (max-width: 800px) {
+
+  .nav-links {
+    display: none;
+  }
+
+  .navbar {
+    height: 70px;
+  }
+
+  .language {
+    display: none;
+  }
+
+  .hero {
+    grid-template-columns: 1fr;
+    padding-top: 55px;
+  }
+
+  .hero h1 {
+    font-size: 50px;
+  }
+
+  .hero p {
+    font-size: 18px;
+  }
+
+  .hero-visual {
+    min-height: 330px;
+    transform: scale(.85);
+  }
+
+  .person-card.left {
+    left: 0;
+  }
+
+  .person-card.right {
+    right: 0;
+  }
+
+  .chat-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    display: none;
+  }
+
+  .chat-panel {
+    min-height: 600px;
+  }
+
+  .chat-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-tabs {
+    padding: 12px;
+  }
+
+  .message {
+    max-width: 82%;
+  }
+
+  .logo {
+    font-size: 22px;
+  }
+}
+</style>
 </head>
 
 <body>
-  <div class="app">
 
-    <header>
-      <div class="logo">RandomTalk</div>
-      <div class="status" id="status">● Online</div>
-    </header>
+<header class="navbar">
+  <div class="nav-inner">
 
-    <section class="hero">
-      <h1>Talk to someone new.</h1>
-      <p>Meet random people through text or video chat.</p>
-    </section>
+    <div class="logo">
+      <div class="logo-icon">💬</div>
+      Random<span>Talk</span>
+    </div>
 
-    <section class="card">
+    <nav class="nav-links">
+      <a href="#">Home</a>
+      <a href="#chat">Chat</a>
+      <a href="#safety">Safety</a>
+      <a href="#about">About</a>
+    </nav>
 
-      <div class="mode-buttons">
-        <button class="mode active" id="textMode">
-          💬 Text Chat
-        </button>
+    <div class="nav-actions">
+      <button class="language">🌐 English</button>
+      <button class="profile">👤</button>
+    </div>
 
-        <button class="mode" id="videoMode">
-          🎥 Video Chat
-        </button>
+  </div>
+</header>
+
+<main>
+
+<section class="hero container">
+
+  <div>
+
+    <h1>
+      Talk to<br>
+      someone <span class="gradient-text">new.</span>
+    </h1>
+
+    <p>
+      Meet random people from around the world
+      through text or video chat.
+    </p>
+
+    <div class="stats">
+      <div class="stat">
+        <span class="online-dot">●</span>
+        12,458 Online now
       </div>
 
-      <div class="video-area" id="videoArea">
-        <div class="video-placeholder">
-          <div class="video-icon">🎥</div>
-          <div>Video chat will appear here</div>
-          <small>Camera access will be added next.</small>
-        </div>
+      <div class="stat">
+        👥 2,345,852 Total users
       </div>
+    </div>
 
-      <div class="chat-area" id="chatArea">
-        <div class="chat-messages" id="messages">
-          <div class="message">
-            👋 Welcome to RandomTalk!
-          </div>
+    <div class="hero-buttons">
+      <button class="primary-btn" onclick="scrollToChat()">
+        🚀 Start Chatting
+      </button>
 
-          <div class="message">
-            Press <b>Start Chat</b> to find someone.
-          </div>
-        </div>
-
-        <div class="message-input">
-          <input
-            id="messageInput"
-            type="text"
-            placeholder="Type a message..."
-          >
-
-          <button class="send" id="sendButton">
-            Send
-          </button>
-        </div>
-      </div>
-
-      <div class="actions">
-        <button class="start" id="startButton">
-          🚀 Start Chat
-        </button>
-
-        <button class="next" id="nextButton">
-          ⏭ Next
-        </button>
-      </div>
-
-      <div class="info" id="info">
-        You're not connected to anyone yet.
-      </div>
-
-    </section>
-
-    <footer>
-      RandomTalk © 2026
-    </footer>
+      <button class="secondary-btn" onclick="showInfo()">
+        ▶ How it works?
+      </button>
+    </div>
 
   </div>
 
-  <script>
-    const textMode = document.getElementById("textMode");
-    const videoMode = document.getElementById("videoMode");
-    const videoArea = document.getElementById("videoArea");
-    const chatArea = document.getElementById("chatArea");
+  <div class="hero-visual">
 
-    const startButton = document.getElementById("startButton");
-    const nextButton = document.getElementById("nextButton");
+    <div class="orbit"></div>
 
-    const status = document.getElementById("status");
-    const info = document.getElementById("info");
+    <div class="person-card left">
+      <div class="avatar">👨🏻</div>
+      <div class="person-info">
+        🇮🇳 India<br>
+        Male, 22
+      </div>
+    </div>
 
-    const messages = document.getElementById("messages");
-    const messageInput = document.getElementById("messageInput");
-    const sendButton = document.getElementById("sendButton");
+    <div class="orbit-center">💬</div>
 
-    let connected = false;
+    <div class="person-card right">
+      <div class="avatar">👩🏻</div>
+      <div class="person-info">
+        🇺🇸 United States<br>
+        Female, 20
+      </div>
+    </div>
 
-    textMode.addEventListener("click", () => {
-      textMode.classList.add("active");
-      videoMode.classList.remove("active");
+  </div>
 
-      videoArea.style.display = "none";
-      chatArea.style.display = "block";
-    });
+</section>
 
-    videoMode.addEventListener("click", () => {
-      videoMode.classList.add("active");
-      textMode.classList.remove("active");
+<section class="container" id="chat">
 
-      videoArea.style.display = "flex";
-      chatArea.style.display = "none";
-    });
+<div class="chat-app">
 
-    startButton.addEventListener("click", () => {
-      connected = true;
+  <div class="chat-tabs">
 
-      status.textContent = "● Searching...";
-      status.style.color = "#ffd166";
+    <button class="tab active" id="textTab" onclick="selectText()">
+      💬 Text Chat
+    </button>
 
-      info.textContent = "Looking for a random person...";
+    <button class="tab" id="videoTab" onclick="selectVideo()">
+      🎥 Video Chat
+    </button>
 
-      startButton.textContent = "🔎 Searching...";
+  </div>
 
-      setTimeout(() => {
-        status.textContent = "● Connected";
-        status.style.color = "#8df5b2";
+  <div class="chat-layout">
 
-        info.textContent = "You are connected to a random person.";
+    <aside class="sidebar">
 
-        startButton.textContent = "🟢 Connected";
+      <h3>⚙️ Chat Preferences</h3>
 
-        if (textMode.classList.contains("active")) {
-          addMessage("🎉 Stranger connected! Say hello.");
-        }
-      }, 1500);
-    });
+      <div class="preference">
 
-    nextButton.addEventListener("click", () => {
-      connected = false;
+        <div class="preference-title">
+          I want to chat with
+        </div>
 
-      status.textContent = "● Online";
-      status.style.color = "#8df5b2";
+        <div class="preference-buttons">
 
-      info.textContent = "Finding another person...";
+          <button class="selected">
+            Everyone
+          </button>
 
-      startButton.textContent = "🔎 Searching...";
+          <button>
+            Gender
+          </button>
 
-      setTimeout(() => {
-        connected = true;
+        </div>
 
-        status.textContent = "● Connected";
-        info.textContent = "You are connected to a new random person.";
-        startButton.textContent = "🟢 Connected";
+      </div>
 
-        addMessage("👋 You found someone new!");
-      }, 1200);
-    });
+      <div class="preference">
 
-    function addMessage(text, you = false) {
-      const message = document.createElement("div");
+        <div class="preference-title">
+          Country
+        </div>
 
-      message.className = "message" + (you ? " you" : "");
-      message.textContent = text;
+        <select class="select-box">
+          <option>Any country</option>
+          <option>India 🇮🇳</option>
+          <option>United States 🇺🇸</option>
+          <option>United Kingdom 🇬🇧</option>
+          <option>Canada 🇨🇦</option>
+        </select>
 
-      messages.appendChild(message);
-      messages.scrollTop = messages.scrollHeight;
-    }
+      </div>
 
-    function sendMessage() {
-      const text = messageInput.value.trim();
+      <button class="save-btn">
+        ✨ Save Preferences
+      </button>
 
-      if (!text) return;
+      <div class="tips" id="safety">
 
-      addMessage(text, true);
-      messageInput.value = "";
+        <h3>💡 Tips</h3>
 
-      if (!connected) {
-        addMessage("⚠️ Start a chat first.");
-        return;
-      }
+        • Be respectful<br>
+        • Don't share personal information<br>
+        • Report inappropriate users<br>
+        • Have fun and enjoy!
 
-      setTimeout(() => {
-        addMessage("👤 Stranger received your message.");
-      }, 600);
-    }
+      </div>
 
-    sendButton.addEventListener("click", sendMessage);
+    </aside>
 
-    messageInput.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        sendMessage();
-      }
-    });
-  </script>
+    <section class="chat-panel">
+
+      <div class="chat-header">
+
+        <div>
+          <div class="connected">● Connected</div>
+          <small>You are chatting with a random stranger</small>
+        </div>
+
+        <button class="report">
+          ⚠ Report
+        </button>
+
+      </div>
+
+      <div class="messages" id="messages">
+
+        <div class="message received">
+          Hey there! 👋
+          <small>10:30 PM</small>
+        </div>
+
+        <div class="message sent">
+          Hi! How are you?
+          <small>10:30 PM ✓✓</small>
+        </div>
+
+        <div class="message received">
+          I'm good, thanks! Where are you from?
+          <small>10:31 PM</small>
+        </div>
+
+        <div class="message sent">
+          I'm from India 🇮🇳
+          <small>10:31 PM ✓✓</small>
+        </div>
+
+        <div class="message received">
+          Nice! I love India. 😊
+          <small>10:31 PM</small>
+        </div>
+
+      </div>
+
+      <div class="message-input">
+
+        <input
+          id="messageInput"
+          type="text"
+          placeholder="Type a message..."
+          onkeydown="handleEnter(event)"
+        >
+
+        <button class="send-btn" onclick="sendMessage()">
+          ➤
+        </button>
+
+      </div>
+
+      <div class="chat-actions">
+
+        <button class="end-btn" onclick="endChat()">
+          ⏹ End Chat
+        </button>
+
+        <button class="next-btn" onclick="nextChat()">
+          ⏭ Next
+        </button>
+
+      </div>
+
+    </section>
+
+  </div>
+
+</div>
+
+</section>
+
+</main>
+
+<footer class="footer" id="about">
+  RandomTalk © 2026 · Talk safely. Meet someone new.
+</footer>
+
+<script>
+
+function scrollToChat() {
+  document.getElementById("chat").scrollIntoView({
+    behavior: "smooth"
+  });
+}
+
+function showInfo() {
+  alert(
+    "RandomTalk lets you meet new people through random text and video conversations."
+  );
+}
+
+function selectText() {
+  document.getElementById("textTab").classList.add("active");
+  document.getElementById("videoTab").classList.remove("active");
+}
+
+function selectVideo() {
+  document.getElementById("videoTab").classList.add("active");
+  document.getElementById("textTab").classList.remove("active");
+
+  alert(
+    "Video chat will be connected in the next development step."
+  );
+}
+
+function sendMessage() {
+
+  const input = document.getElementById("messageInput");
+  const messages = document.getElementById("messages");
+
+  const text = input.value.trim();
+
+  if (!text) return;
+
+  const message = document.createElement("div");
+
+  message.className = "message sent";
+
+  message.innerHTML =
+    escapeHTML(text) +
+    "<small>Now ✓✓</small>";
+
+  messages.appendChild(message);
+
+  input.value = "";
+
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function handleEnter(event) {
+  if (event.key === "Enter") {
+    sendMessage();
+  }
+}
+
+function nextChat() {
+
+  alert(
+    "The real random matching system will be connected next."
+  );
+}
+
+function endChat() {
+
+  alert(
+    "Chat ended. The real disconnect system will be connected next."
+  );
+}
+
+function escapeHTML(text) {
+
+  const div = document.createElement("div");
+
+  div.textContent = text;
+
+  return div.innerHTML;
+}
+
+</script>
 
 </body>
-</html>`;
-
-    return new Response(html, {
+</html>`, {
       headers: {
         "content-type": "text/html; charset=UTF-8"
       }
