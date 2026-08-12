@@ -8,7 +8,7 @@ export default {
 </head>
 <body>
   <h1>RandomTalk</h1>
-  <p<p>RandomTalk Worker is working!</p>
+  <p>RandomTalk Worker is working!</p>
 </body>
 </html>`,
       {
