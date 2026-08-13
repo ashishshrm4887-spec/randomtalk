@@ -1,5 +1,187 @@
+export class ChatRoom {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.waiting = null;
+    this.partners = new Map();
+  }
+
+  async fetch(request) {
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("ChatRoom is running.");
+    }
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
+    server.accept();
+
+    if (this.waiting && this.waiting.readyState === WebSocket.OPEN) {
+      const other = this.waiting;
+
+      this.waiting = null;
+
+      this.partners.set(server, other);
+      this.partners.set(other, server);
+
+      server.send(JSON.stringify({
+        type: "matched"
+      }));
+
+      other.send(JSON.stringify({
+        type: "matched"
+      }));
+    } else {
+      this.waiting = server;
+
+      server.send(JSON.stringify({
+        type: "waiting"
+      }));
+    }
+
+    server.addEventListener("message", event => {
+      let data;
+
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      const partner = this.partners.get(server);
+
+      if (data.type === "chat") {
+        if (partner && partner.readyState === WebSocket.OPEN) {
+          partner.send(JSON.stringify({
+            type: "chat",
+            text: String(data.text || "").slice(0, 2000)
+          }));
+        }
+      }
+
+      if (data.type === "next") {
+        this.disconnectPair(server);
+        this.waitForUser(server);
+      }
+
+      if (data.type === "end") {
+        this.disconnectPair(server);
+        this.removeUser(server);
+      }
+    });
+
+    const cleanup = () => {
+      if (this.waiting === server) {
+        this.waiting = null;
+      }
+
+      const partner = this.partners.get(server);
+
+      if (partner) {
+        this.partners.delete(server);
+        this.partners.delete(partner);
+
+        if (partner.readyState === WebSocket.OPEN) {
+          partner.send(JSON.stringify({
+            type: "partner_left"
+          }));
+
+          this.waiting = partner;
+
+          partner.send(JSON.stringify({
+            type: "waiting"
+          }));
+        }
+      }
+    };
+
+    server.addEventListener("close", cleanup);
+    server.addEventListener("error", cleanup);
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client
+    });
+  }
+
+  waitForUser(socket) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    if (this.waiting && this.waiting !== socket) {
+      const other = this.waiting;
+
+      if (other.readyState === WebSocket.OPEN) {
+        this.waiting = null;
+
+        this.partners.set(socket, other);
+        this.partners.set(other, socket);
+
+        socket.send(JSON.stringify({
+          type: "matched"
+        }));
+
+        other.send(JSON.stringify({
+          type: "matched"
+        }));
+
+        return;
+      }
+    }
+
+    this.waiting = socket;
+
+    socket.send(JSON.stringify({
+      type: "waiting"
+    }));
+  }
+
+  disconnectPair(socket) {
+    const partner = this.partners.get(socket);
+
+    if (!partner) {
+      return;
+    }
+
+    this.partners.delete(socket);
+    this.partners.delete(partner);
+
+    if (partner.readyState === WebSocket.OPEN) {
+      partner.send(JSON.stringify({
+        type: "partner_left"
+      }));
+    }
+  }
+
+  removeUser(socket) {
+    if (this.waiting === socket) {
+      this.waiting = null;
+    }
+
+    this.partners.delete(socket);
+  }
+}
+
+
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+
+    /*
+     * REAL-TIME CHAT CONNECTION
+     */
+    if (url.pathname === "/ws") {
+      const id = env.CHAT.idFromName("global-chat-room");
+      const room = env.CHAT.get(id);
+
+      return room.fetch(request);
+    }
+
+    /*
+     * RANDOMTALK WEBSITE
+     */
     return new Response(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -39,8 +221,6 @@ button {
   width: min(1180px, calc(100% - 32px));
   margin: auto;
 }
-
-/* NAVBAR */
 
 .navbar {
   height: 82px;
@@ -116,8 +296,6 @@ button {
   border-radius: 50%;
 }
 
-/* HERO */
-
 .hero {
   padding: 80px 0 55px;
   display: grid;
@@ -191,8 +369,6 @@ button {
   color: white;
 }
 
-/* HERO VISUAL */
-
 .hero-visual {
   min-height: 380px;
   position: relative;
@@ -254,8 +430,6 @@ button {
   padding: 10px 3px 3px;
   line-height: 1.5;
 }
-
-/* CHAT AREA */
 
 .chat-app {
   border: 1px solid #25304a;
@@ -362,8 +536,6 @@ button {
   line-height: 1.9;
 }
 
-/* CHAT */
-
 .chat-panel {
   min-height: 620px;
   display: flex;
@@ -380,6 +552,11 @@ button {
 
 .connected {
   color: #4ade80;
+  font-weight: 800;
+}
+
+.waiting {
+  color: #fbbf24;
   font-weight: 800;
 }
 
@@ -476,18 +653,13 @@ button {
   background: linear-gradient(90deg,#d946ef,#7c3aed);
 }
 
-/* FOOTER */
-
 .footer {
   text-align: center;
   color: #64748b;
   padding: 20px 0 50px;
 }
 
-/* MOBILE */
-
 @media (max-width: 800px) {
-
   .nav-links {
     display: none;
   }
@@ -601,11 +773,11 @@ button {
     <div class="stats">
       <div class="stat">
         <span class="online-dot">●</span>
-        12,458 Online now
+        <span id="onlineCount">Online now</span>
       </div>
 
       <div class="stat">
-        👥 2,345,852 Total users
+        👥 Random conversations
       </div>
     </div>
 
@@ -629,7 +801,7 @@ button {
       <div class="avatar">👨🏻</div>
       <div class="person-info">
         🇮🇳 India<br>
-        Male, 22
+        Random User
       </div>
     </div>
 
@@ -638,8 +810,8 @@ button {
     <div class="person-card right">
       <div class="avatar">👩🏻</div>
       <div class="person-info">
-        🇺🇸 United States<br>
-        Female, 20
+        🌎 Worldwide<br>
+        Random User
       </div>
     </div>
 
@@ -727,11 +899,16 @@ button {
       <div class="chat-header">
 
         <div>
-          <div class="connected">● Connected</div>
-          <small>You are chatting with a random stranger</small>
+          <div class="waiting" id="connectionStatus">
+            ● Ready
+          </div>
+
+          <small id="connectionText">
+            Press Start Chatting to find someone
+          </small>
         </div>
 
-        <button class="report">
+        <button class="report" onclick="reportUser()">
           ⚠ Report
         </button>
 
@@ -740,28 +917,13 @@ button {
       <div class="messages" id="messages">
 
         <div class="message received">
-          Hey there! 👋
-          <small>10:30 PM</small>
-        </div>
-
-        <div class="message sent">
-          Hi! How are you?
-          <small>10:30 PM ✓✓</small>
+          👋 Welcome to RandomTalk!
+          <small>System</small>
         </div>
 
         <div class="message received">
-          I'm good, thanks! Where are you from?
-          <small>10:31 PM</small>
-        </div>
-
-        <div class="message sent">
-          I'm from India 🇮🇳
-          <small>10:31 PM ✓✓</small>
-        </div>
-
-        <div class="message received">
-          Nice! I love India. 😊
-          <small>10:31 PM</small>
+          Press <b>Start Chatting</b> to find a random person.
+          <small>System</small>
         </div>
 
       </div>
@@ -772,6 +934,7 @@ button {
           id="messageInput"
           type="text"
           placeholder="Type a message..."
+          disabled
           onkeydown="handleEnter(event)"
         >
 
@@ -787,8 +950,8 @@ button {
           ⏹ End Chat
         </button>
 
-        <button class="next-btn" onclick="nextChat()">
-          ⏭ Next
+        <button class="next-btn" id="startNextButton" onclick="startOrNext()">
+          🚀 Start Chatting
         </button>
 
       </div>
@@ -807,86 +970,438 @@ button {
   RandomTalk © 2026 · Talk safely. Meet someone new.
 </footer>
 
+
 <script>
 
-function scrollToChat() {
-  document.getElementById("chat").scrollIntoView({
-    behavior: "smooth"
+let socket = null;
+let connected = false;
+let intentionallyClosed = false;
+
+
+/* CONNECT TO CLOUDFLARE WEBSOCKET */
+
+function connectSocket() {
+
+  if (socket &&
+      (socket.readyState === WebSocket.OPEN ||
+       socket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  const protocol =
+    location.protocol === "https:" ? "wss:" : "ws:";
+
+  socket = new WebSocket(
+    protocol + "//" + location.host + "/ws"
+  );
+
+  socket.addEventListener("open", () => {
+
+    updateStatus(
+      "● Searching...",
+      "Looking for a random person...",
+      false
+    );
+
+  });
+
+  socket.addEventListener("message", event => {
+
+    let data;
+
+    try {
+      data = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+
+    if (data.type === "waiting") {
+
+      connected = false;
+
+      updateStatus(
+        "● Searching...",
+        "Waiting for another person...",
+        false
+      );
+
+      setButton("⏳ Searching...");
+      disableInput();
+
+    }
+
+    if (data.type === "matched") {
+
+      connected = true;
+
+      updateStatus(
+        "● Connected",
+        "You are chatting with a random stranger",
+        true
+      );
+
+      setButton("⏭ Next");
+      enableInput();
+
+      addSystemMessage("🎉 You are connected! Say hello.");
+    }
+
+    if (data.type === "chat") {
+
+      addReceivedMessage(data.text);
+    }
+
+    if (data.type === "partner_left") {
+
+      connected = false;
+
+      updateStatus(
+        "● Stranger left",
+        "Finding another person...",
+        false
+      );
+
+      disableInput();
+      setButton("⏳ Searching...");
+
+      addSystemMessage(
+        "👋 The stranger left. Looking for someone else..."
+      );
+    }
+
+  });
+
+  socket.addEventListener("close", () => {
+
+    connected = false;
+
+    if (!intentionallyClosed) {
+
+      updateStatus(
+        "● Disconnected",
+        "Connection lost. Press Start Chatting.",
+        false
+      );
+
+      disableInput();
+      setButton("🚀 Start Chatting");
+    }
+
+  });
+
+  socket.addEventListener("error", () => {
+
+    updateStatus(
+      "● Connection error",
+      "Please try again.",
+      false
+    );
+
   });
 }
 
-function showInfo() {
-  alert(
-    "RandomTalk lets you meet new people through random text and video conversations."
-  );
+
+/* START / NEXT */
+
+function startOrNext() {
+
+  if (!socket ||
+      socket.readyState !== WebSocket.OPEN) {
+
+    intentionallyClosed = false;
+    connectSocket();
+    return;
+  }
+
+  if (connected) {
+
+    clearMessages();
+
+    socket.send(JSON.stringify({
+      type: "next"
+    }));
+
+    connected = false;
+
+    updateStatus(
+      "● Searching...",
+      "Finding another person...",
+      false
+    );
+
+    disableInput();
+    setButton("⏳ Searching...");
+
+  } else {
+
+    updateStatus(
+      "● Searching...",
+      "Finding someone...",
+      false
+    );
+
+  }
 }
 
-function selectText() {
-  document.getElementById("textTab").classList.add("active");
-  document.getElementById("videoTab").classList.remove("active");
-}
 
-function selectVideo() {
-  document.getElementById("videoTab").classList.add("active");
-  document.getElementById("textTab").classList.remove("active");
-
-  alert(
-    "Video chat will be connected in the next development step."
-  );
-}
+/* SEND MESSAGE */
 
 function sendMessage() {
 
-  const input = document.getElementById("messageInput");
-  const messages = document.getElementById("messages");
+  const input =
+    document.getElementById("messageInput");
 
   const text = input.value.trim();
 
-  if (!text) return;
+  if (!text || !connected) {
+    return;
+  }
 
-  const message = document.createElement("div");
+  if (!socket ||
+      socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
 
-  message.className = "message sent";
+  socket.send(JSON.stringify({
+    type: "chat",
+    text: text
+  }));
 
-  message.innerHTML =
-    escapeHTML(text) +
-    "<small>Now ✓✓</small>";
-
-  messages.appendChild(message);
+  addSentMessage(text);
 
   input.value = "";
-
-  messages.scrollTop = messages.scrollHeight;
 }
 
+
+/* ENTER */
+
 function handleEnter(event) {
+
   if (event.key === "Enter") {
     sendMessage();
   }
 }
 
-function nextChat() {
 
-  alert(
-    "The real random matching system will be connected next."
-  );
-}
+/* END CHAT */
 
 function endChat() {
 
-  alert(
-    "Chat ended. The real disconnect system will be connected next."
+  if (socket &&
+      socket.readyState === WebSocket.OPEN) {
+
+    socket.send(JSON.stringify({
+      type: "end"
+    }));
+
+    intentionallyClosed = true;
+    socket.close();
+  }
+
+  connected = false;
+
+  disableInput();
+
+  updateStatus(
+    "● Offline",
+    "Chat ended.",
+    false
   );
+
+  setButton("🚀 Start Chatting");
+
+  addSystemMessage("Chat ended.");
 }
 
-function escapeHTML(text) {
+
+/* UI HELPERS */
+
+function updateStatus(title, text, isConnected) {
+
+  const status =
+    document.getElementById("connectionStatus");
+
+  const description =
+    document.getElementById("connectionText");
+
+  status.textContent = title;
+  description.textContent = text;
+
+  status.className =
+    isConnected ? "connected" : "waiting";
+}
+
+
+function setButton(text) {
+
+  document.getElementById(
+    "startNextButton"
+  ).textContent = text;
+}
+
+
+function enableInput() {
+
+  document.getElementById(
+    "messageInput"
+  ).disabled = false;
+
+  document.getElementById(
+    "messageInput"
+  ).placeholder = "Type a message...";
+}
+
+
+function disableInput() {
+
+  document.getElementById(
+    "messageInput"
+  ).disabled = true;
+
+  document.getElementById(
+    "messageInput"
+  ).placeholder = "Waiting for a stranger...";
+}
+
+
+function clearMessages() {
+
+  document.getElementById(
+    "messages"
+  ).innerHTML = "";
+}
+
+
+function addSystemMessage(text) {
 
   const div = document.createElement("div");
 
+  div.className = "message received";
+
   div.textContent = text;
 
-  return div.innerHTML;
+  document.getElementById(
+    "messages"
+  ).appendChild(div);
+
+  scrollMessages();
 }
+
+
+function addReceivedMessage(text) {
+
+  const div = document.createElement("div");
+
+  div.className = "message received";
+
+  div.textContent = text;
+
+  document.getElementById(
+    "messages"
+  ).appendChild(div);
+
+  scrollMessages();
+}
+
+
+function addSentMessage(text) {
+
+  const div = document.createElement("div");
+
+  div.className = "message sent";
+
+  div.textContent = text;
+
+  document.getElementById(
+    "messages"
+  ).appendChild(div);
+
+  scrollMessages();
+}
+
+
+function scrollMessages() {
+
+  const box =
+    document.getElementById("messages");
+
+  box.scrollTop = box.scrollHeight;
+}
+
+
+/* OTHER UI */
+
+function scrollToChat() {
+
+  document.getElementById(
+    "chat"
+  ).scrollIntoView({
+    behavior: "smooth"
+  });
+}
+
+
+function showInfo() {
+
+  alert(
+    "RandomTalk matches you with another available person for a conversation."
+  );
+}
+
+
+function selectText() {
+
+  document.getElementById(
+    "textTab"
+  ).classList.add("active");
+
+  document.getElementById(
+    "videoTab"
+  ).classList.remove("active");
+}
+
+
+function selectVideo() {
+
+  document.getElementById(
+    "videoTab"
+  ).classList.add("active");
+
+  document.getElementById(
+    "textTab"
+  ).classList.remove("active");
+
+  alert(
+    "Real video chat will be added after the text-chat system is tested."
+  );
+}
+
+
+function reportUser() {
+
+  if (!connected) {
+
+    alert("You are not currently connected.");
+
+    return;
+  }
+
+  alert(
+    "Report system will be connected to the moderation database next."
+  );
+}
+
+
+/* START SOCKET WHEN PAGE LOADS */
+
+window.addEventListener("load", () => {
+
+  /*
+   * We don't connect immediately.
+   * The user starts matching by pressing Start Chatting.
+   */
+
+});
 
 </script>
 
