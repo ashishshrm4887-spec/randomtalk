@@ -2343,7 +2343,26 @@ disableInput();
 
 console.log(
   "RandomTalk JavaScript loaded successfully."
-);
+);window.reportUser = function () {
+  if (!connected) {
+    alert("You are not currently connected.");
+    return;
+  }
+
+  const reason = prompt(
+    "Report reason:\n\n" +
+    "1 - Nudity / sexual content\n" +
+    "2 - Harassment / bullying\n" +
+    "3 - Threats / violence\n" +
+    "4 - Spam / scam\n" +
+    "5 - Underage concern\n" +
+    "6 - Other"
+  );
+
+  if (!reason) return;
+
+  alert("Thank you. Your report has been received.");
+};
 
 </script>
 
