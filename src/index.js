@@ -1,117 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
 
-const MAX_TEXT = 2000;
-const MAX_REPORT = 1000;
-
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=UTF-8",
-      "cache-control": "no-store"
-    }
-  });
-}
-
-function cleanText(value, max = MAX_TEXT) {
-  return String(value ?? "").trim().slice(0, max);
-}
-
-function normalizePrefs(raw) {
-  const p = raw && typeof raw === "object" ? raw : {};
-
-  return {
-    gender: ["any", "male", "female", "other"].includes(p.gender)
-      ? p.gender
-      : "any",
-
-    country: cleanText(p.country, 60) || "any",
-
-    mode: p.mode === "video" ? "video" : "text"
-  };
-}
-
-function compatible(a, b) {
-  const genderOK =
-    a.gender === "any" ||
-    b.gender === "any" ||
-    a.gender === b.gender;
-
-  const countryOK =
-    a.country.toLowerCase() === "any" ||
-    b.country.toLowerCase() === "any" ||
-    a.country.toLowerCase() === b.country.toLowerCase();
-
-  const modeOK = a.mode === b.mode;
-
-  return genderOK && countryOK && modeOK;
-}
-
-function send(ws, data) {
-  try {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(data));
-      return true;
-    }
-  } catch {}
-
-  return false;
-}
-
-
 /* =========================================================
-   WORKER
+   RANDOMTALK
+   VIDEO CHAT ONLY
+   + In-video text messaging
+   + Gender matching
+   + Country matching
+   + Report
+   + WebRTC recovery
 ========================================================= */
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-
-    /*
-     * Health check
-     */
-    if (url.pathname === "/health") {
-      return json({
-        ok: true,
-        service: "RandomTalk",
-        time: Date.now()
-      });
-    }
-
-    /*
-     * WebSocket endpoint
-     */
-    if (url.pathname === "/ws") {
-      if (
-        request.headers.get("Upgrade")?.toLowerCase() !==
-        "websocket"
-      ) {
-        return new Response(
-          "WebSocket upgrade required",
-          { status: 426 }
-        );
-      }
-
-      const room = env.CHAT_ROOM.getByName("global");
-
-      return room.fetch(request);
-    }
-
-    /*
-     * Website
-     */
-    if (request.method === "GET") {
-      return new Response(APP_HTML, {
-        headers: {
-          "content-type": "text/html; charset=UTF-8",
-          "cache-control": "no-store"
-        }
-      });
-    }
-
-    return new Response("Not found", { status: 404 });
-  }
-};
 
 
 /* =========================================================
@@ -125,104 +22,73 @@ export class ChatRoom extends DurableObject {
 
     this.ctx = ctx;
     this.env = env;
-    this.sessions = new Map();
-
-    /*
-     * Restore WebSocket sessions after hibernation.
-     */
-    for (const ws of this.ctx.getWebSockets()) {
-      try {
-        const data = ws.deserializeAttachment();
-
-        if (data?.id) {
-          this.sessions.set(data.id, {
-            ws,
-            id: data.id,
-            prefs: normalizePrefs(data.prefs),
-            partnerId: data.partnerId || null,
-            waiting: !!data.waiting,
-            createdAt: data.createdAt || Date.now()
-          });
-        }
-      } catch {}
-    }
-
-    /*
-     * Ping/pong handled by Cloudflare without waking
-     * the Durable Object.
-     */
-    try {
-      this.ctx.setWebSocketAutoResponse(
-        new WebSocketRequestResponsePair(
-          "ping",
-          "pong"
-        )
-      );
-    } catch {}
   }
 
 
-  async fetch(request) {
+  /* =======================================================
+     HELPERS
+  ======================================================= */
+
+  send(ws, data) {
 
     if (
-      request.headers.get("Upgrade")?.toLowerCase() !==
-      "websocket"
+      !ws ||
+      ws.readyState !== WebSocket.OPEN
     ) {
-      return new Response(
-        "Expected WebSocket",
-        { status: 426 }
-      );
+      return;
     }
 
-    const pair = new WebSocketPair();
-
-    const [client, server] =
-      Object.values(pair);
-
-    const id = crypto.randomUUID();
-
-    const session = {
-      ws: server,
-      id,
-      prefs: normalizePrefs({}),
-      partnerId: null,
-      waiting: false,
-      createdAt: Date.now()
-    };
-
-    /*
-     * Hibernation WebSocket API.
-     */
-    this.ctx.acceptWebSocket(server);
-
-    server.serializeAttachment({
-      id,
-      prefs: session.prefs,
-      partnerId: null,
-      waiting: false,
-      createdAt: session.createdAt
-    });
-
-    this.sessions.set(id, session);
-
-    send(server, {
-      type: "hello",
-      id,
-      message: "Connected to RandomTalk"
-    });
-
-    return new Response(null, {
-      status: 101,
-      webSocket: client
-    });
+    try {
+      ws.send(JSON.stringify(data));
+    } catch (error) {
+      console.error("Send error:", error);
+    }
   }
 
 
-  findSession(ws) {
+  getInfo(ws) {
 
-    for (const session of this.sessions.values()) {
-      if (session.ws === ws) {
-        return session;
+    try {
+      return ws.deserializeAttachment() || {};
+    } catch {
+      return {};
+    }
+  }
+
+
+  setInfo(ws, info) {
+
+    try {
+      ws.serializeAttachment(info);
+    } catch (error) {
+      console.error(
+        "Attachment error:",
+        error
+      );
+    }
+  }
+
+
+  getSockets() {
+    return this.ctx.getWebSockets();
+  }
+
+
+  findById(id) {
+
+    if (!id) {
+      return null;
+    }
+
+    for (
+      const ws of this.getSockets()
+    ) {
+
+      const info =
+        this.getInfo(ws);
+
+      if (info.id === id) {
+        return ws;
       }
     }
 
@@ -230,537 +96,1202 @@ export class ChatRoom extends DurableObject {
   }
 
 
-  saveSession(session) {
+  /* =======================================================
+     MATCHING
+  ======================================================= */
 
-    try {
-      session.ws.serializeAttachment({
-        id: session.id,
-        prefs: session.prefs,
-        partnerId: session.partnerId,
-        waiting: session.waiting,
-        createdAt: session.createdAt
-      });
-    } catch {}
+  canMatch(a, b) {
+
+    if (!a || !b) {
+      return false;
+    }
+
+
+    if (
+      a.status !== "waiting" ||
+      b.status !== "waiting"
+    ) {
+      return false;
+    }
+
+
+    /*
+      Video users only.
+    */
+
+    if (
+      a.mode !== "video" ||
+      b.mode !== "video"
+    ) {
+      return false;
+    }
+
+
+    /*
+      Country.
+    */
+
+    const countryA =
+      String(a.country || "any")
+        .toLowerCase();
+
+    const countryB =
+      String(b.country || "any")
+        .toLowerCase();
+
+
+    const countryOK =
+      countryA === "any" ||
+      countryB === "any" ||
+      countryA === countryB;
+
+
+    if (!countryOK) {
+      return false;
+    }
+
+
+    /*
+      Gender preference.
+    */
+
+    const genderA =
+      a.gender || "other";
+
+    const genderB =
+      b.gender || "other";
+
+
+    const wantsA =
+      a.preferredGender || "any";
+
+    const wantsB =
+      b.preferredGender || "any";
+
+
+    const genderAOK =
+      wantsA === "any" ||
+      wantsA === genderB;
+
+
+    const genderBOK =
+      wantsB === "any" ||
+      wantsB === genderA;
+
+
+    return (
+      genderAOK &&
+      genderBOK
+    );
   }
 
 
-  async webSocketMessage(ws, message) {
+  findMatch(ws) {
 
-    const session = this.findSession(ws);
+    const user =
+      this.getInfo(ws);
 
-    if (!session) {
-      return;
+
+    for (
+      const other of this.getSockets()
+    ) {
+
+      if (other === ws) {
+        continue;
+      }
+
+
+      if (
+        other.readyState !==
+        WebSocket.OPEN
+      ) {
+        continue;
+      }
+
+
+      const otherInfo =
+        this.getInfo(other);
+
+
+      if (
+        this.canMatch(
+          user,
+          otherInfo
+        )
+      ) {
+        return other;
+      }
     }
+
+
+    return null;
+  }
+
+
+  /* =======================================================
+     CONNECTION
+  ======================================================= */
+
+  async fetch(request) {
+
+    if (
+      request.headers.get("Upgrade")
+        ?.toLowerCase() !== "websocket"
+    ) {
+
+      return new Response(
+        "RandomTalk Video ChatRoom is running.",
+        {
+          status: 200
+        }
+      );
+    }
+
+
+    const pair =
+      new WebSocketPair();
+
+
+    const client =
+      pair[0];
+
+    const server =
+      pair[1];
+
+
+    this.ctx.acceptWebSocket(
+      server
+    );
+
+
+    const id =
+      crypto.randomUUID();
+
+
+    this.setInfo(server, {
+
+      id,
+
+      mode: "video",
+
+      status: "idle",
+
+      gender: "other",
+
+      preferredGender: "any",
+
+      country: "any",
+
+      partnerId: null,
+
+      joinedAt: Date.now()
+
+    });
+
+
+    return new Response(
+      null,
+      {
+        status: 101,
+        webSocket: client
+      }
+    );
+  }
+
+
+  /* =======================================================
+     MESSAGE
+  ======================================================= */
+
+  async webSocketMessage(
+    ws,
+    message
+  ) {
 
     let data;
 
+
     try {
-      data = JSON.parse(
-        typeof message === "string"
-          ? message
-          : new TextDecoder().decode(message)
-      );
+
+      if (
+        typeof message ===
+        "string"
+      ) {
+
+        data =
+          JSON.parse(message);
+
+      } else {
+
+        data =
+          JSON.parse(
+            new TextDecoder()
+              .decode(message)
+          );
+      }
+
     } catch {
-      send(ws, {
+
+      this.send(ws, {
         type: "error",
-        message: "Invalid message."
+        message:
+          "Invalid message."
       });
 
       return;
     }
 
-    const type = String(data?.type || "");
-
-
-    /* =========================
-       PREFERENCES
-    ========================= */
-
-    if (type === "prefs") {
-
-      session.prefs =
-        normalizePrefs(data.prefs);
-
-      this.saveSession(session);
-
-      send(ws, {
-        type: "prefs_ok",
-        prefs: session.prefs
-      });
-
-      return;
-    }
-
-
-    /* =========================
-       FIND
-    ========================= */
-
-    if (type === "find") {
-
-      session.prefs =
-        normalizePrefs(
-          data.prefs || session.prefs
-        );
-
-      this.saveSession(session);
-
-      await this.findPartner(session);
-
-      return;
-    }
-
-
-    /* =========================
-       NEXT
-    ========================= */
-
-    if (type === "next") {
-
-      await this.endPair(
-        session,
-        "next"
-      );
-
-      await this.findPartner(session);
-
-      return;
-    }
-
-
-    /* =========================
-       END
-    ========================= */
-
-    if (type === "end") {
-
-      await this.endPair(
-        session,
-        "ended"
-      );
-
-      return;
-    }
-
-
-    /* =========================
-       REPORT
-    ========================= */
-
-    if (type === "report") {
-
-      const reason =
-        cleanText(
-          data.reason,
-          MAX_REPORT
-        ) || "unspecified";
-
-      await this.report(
-        session,
-        reason
-      );
-
-      return;
-    }
-
-
-    /* =========================
-       WEBRTC SIGNALING
-    ========================= */
 
     if (
-      type === "offer" ||
-      type === "answer" ||
-      type === "candidate"
+      !data ||
+      !data.type
+    ) {
+      return;
+    }
+
+
+    /* =====================================================
+       JOIN
+    ===================================================== */
+
+    if (
+      data.type === "join"
     ) {
 
-      const partner =
-        session.partnerId
-          ? this.sessions.get(
-              session.partnerId
-            )
-          : null;
+      const oldInfo =
+        this.getInfo(ws);
 
-      if (!partner) {
 
-        send(ws, {
-          type: "signal_error",
+      const gender =
+        [
+          "male",
+          "female",
+          "other"
+        ].includes(
+          data.gender
+        )
+          ? data.gender
+          : "other";
+
+
+      const preferredGender =
+        [
+          "male",
+          "female",
+          "other",
+          "any"
+        ].includes(
+          data.preferredGender
+        )
+          ? data.preferredGender
+          : "any";
+
+
+      const country =
+        typeof data.country ===
+        "string"
+          ? data.country
+              .trim()
+              .slice(0, 40)
+              .toLowerCase()
+          : "any";
+
+
+      const info = {
+
+        ...oldInfo,
+
+        mode: "video",
+
+        status: "waiting",
+
+        gender,
+
+        preferredGender,
+
+        country:
+          country || "any",
+
+        partnerId: null
+
+      };
+
+
+      this.setInfo(
+        ws,
+        info
+      );
+
+
+      const other =
+        this.findMatch(ws);
+
+
+      if (!other) {
+
+        this.send(ws, {
+
+          type: "waiting",
+
           message:
-            "Partner is no longer connected."
+            "Looking for another person..."
+
         });
 
         return;
       }
 
-      send(partner.ws, {
-        type,
-        from: session.id,
-        data: data.data ?? null
+
+      const otherInfo =
+        this.getInfo(other);
+
+
+      const thisId =
+        info.id;
+
+      const otherId =
+        otherInfo.id;
+
+
+      this.setInfo(
+        ws,
+        {
+          ...info,
+          status: "matched",
+          partnerId: otherId
+        }
+      );
+
+
+      this.setInfo(
+        other,
+        {
+          ...otherInfo,
+          status: "matched",
+          partnerId: thisId
+        }
+      );
+
+
+      /*
+        Caller.
+      */
+
+      this.send(ws, {
+
+        type: "matched",
+
+        role: "caller",
+
+        partnerId: otherId,
+
+        mode: "video"
+
       });
+
+
+      /*
+        Callee.
+      */
+
+      this.send(other, {
+
+        type: "matched",
+
+        role: "callee",
+
+        partnerId: thisId,
+
+        mode: "video"
+
+      });
+
 
       return;
     }
 
 
-    /* =========================
-       TEXT CHAT
-    ========================= */
+    /* =====================================================
+       CHAT MESSAGE
+    ===================================================== */
 
-    if (type === "chat") {
+    if (
+      data.type === "chat"
+    ) {
+
+      const info =
+        this.getInfo(ws);
+
+
+      if (
+        info.status !==
+        "matched" ||
+        !info.partnerId
+      ) {
+        return;
+      }
+
+
+      const partner =
+        this.findById(
+          info.partnerId
+        );
+
+
+      if (!partner) {
+        return;
+      }
+
 
       const text =
-        cleanText(data.text);
+        String(
+          data.text || ""
+        )
+          .trim()
+          .slice(0, 500);
+
 
       if (!text) {
         return;
       }
 
+
+      this.send(
+        partner,
+        {
+
+          type: "chat",
+
+          text
+
+        }
+      );
+
+
+      return;
+    }
+
+
+    /* =====================================================
+       WEBRTC SIGNAL
+    ===================================================== */
+
+    if (
+      data.type ===
+      "signal"
+    ) {
+
+      const info =
+        this.getInfo(ws);
+
+
+      if (
+        !info.partnerId
+      ) {
+        return;
+      }
+
+
       const partner =
-        session.partnerId
-          ? this.sessions.get(
-              session.partnerId
-            )
-          : null;
+        this.findById(
+          info.partnerId
+        );
+
 
       if (!partner) {
         return;
       }
 
-      send(partner.ws, {
-        type: "chat",
-        text,
-        from: "partner",
-        at: Date.now()
-      });
+
+      this.send(
+        partner,
+        {
+
+          type: "signal",
+
+          signal:
+            data.signal
+
+        }
+      );
+
 
       return;
     }
 
 
-    /* =========================
-       TYPING
-    ========================= */
+    /* =====================================================
+       NEXT
+    ===================================================== */
 
-    if (type === "typing") {
+    if (
+      data.type === "next"
+    ) {
+
+      const info =
+        this.getInfo(ws);
+
 
       const partner =
-        session.partnerId
-          ? this.sessions.get(
-              session.partnerId
+        info.partnerId
+          ? this.findById(
+              info.partnerId
             )
           : null;
 
+
+      /*
+        Tell current partner.
+      */
+
       if (partner) {
-        send(partner.ws, {
-          type: "typing",
-          value: !!data.value
-        });
-      }
 
-      return;
-    }
-  }
+        const partnerInfo =
+          this.getInfo(
+            partner
+          );
 
 
-  async webSocketClose(ws) {
+        this.setInfo(
+          partner,
+          {
 
-    const session =
-      this.findSession(ws);
+            ...partnerInfo,
 
-    if (!session) {
-      return;
-    }
+            status: "waiting",
 
-    const partner =
-      session.partnerId
-        ? this.sessions.get(
-            session.partnerId
-          )
-        : null;
+            partnerId: null
 
-    if (partner) {
-
-      partner.partnerId = null;
-      partner.waiting = false;
-
-      this.saveSession(partner);
-
-      send(partner.ws, {
-        type: "partner_left",
-        message:
-          "Your partner disconnected."
-      });
-    }
-
-    this.sessions.delete(
-      session.id
-    );
-  }
-
-
-  async findPartner(session) {
-
-    if (session.partnerId) {
-      return;
-    }
-
-    /*
-     * Remove dead connections.
-     */
-    for (const [id, candidate]
-      of this.sessions) {
-
-      if (
-        candidate.ws.readyState !==
-        WebSocket.OPEN
-      ) {
-        this.sessions.delete(id);
-      }
-    }
-
-
-    let best = null;
-    let bestScore = -1;
-
-
-    for (
-      const candidate
-      of this.sessions.values()
-    ) {
-
-      if (
-        candidate.id === session.id
-      ) {
-        continue;
-      }
-
-      if (candidate.partnerId) {
-        continue;
-      }
-
-      if (!candidate.waiting) {
-        continue;
-      }
-
-      if (
-        !compatible(
-          session.prefs,
-          candidate.prefs
-        )
-      ) {
-        continue;
-      }
-
-
-      let score = 0;
-
-
-      if (
-        session.prefs.gender !== "any" &&
-        session.prefs.gender ===
-          candidate.prefs.gender
-      ) {
-        score += 2;
-      }
-
-
-      if (
-        session.prefs.country !== "any" &&
-        session.prefs.country.toLowerCase() ===
-          candidate.prefs.country.toLowerCase()
-      ) {
-        score += 2;
-      }
-
-
-      if (
-        session.prefs.mode ===
-        candidate.prefs.mode
-      ) {
-        score += 1;
-      }
-
-
-      if (score > bestScore) {
-
-        bestScore = score;
-        best = candidate;
-      }
-    }
-
-
-    /*
-     * Nobody available.
-     */
-    if (!best) {
-
-      session.waiting = true;
-
-      this.saveSession(session);
-
-      send(session.ws, {
-        type: "searching",
-        message:
-          "Looking for someone..."
-      });
-
-      return;
-    }
-
-
-    /*
-     * MATCH FOUND
-     */
-
-    session.waiting = false;
-    best.waiting = false;
-
-    session.partnerId = best.id;
-    best.partnerId = session.id;
-
-    this.saveSession(session);
-    this.saveSession(best);
-
-    const matchId =
-      crypto.randomUUID();
-
-
-    /*
-     * Caller
-     */
-    send(session.ws, {
-      type: "matched",
-      role: "caller",
-      matchId,
-      mode: session.prefs.mode
-    });
-
-
-    /*
-     * Callee
-     */
-    send(best.ws, {
-      type: "matched",
-      role: "callee",
-      matchId,
-      mode: best.prefs.mode
-    });
-  }
-
-
-  async endPair(
-    session,
-    reason
-  ) {
-
-    const partner =
-      session.partnerId
-        ? this.sessions.get(
-            session.partnerId
-          )
-        : null;
-
-
-    session.partnerId = null;
-    session.waiting = false;
-
-    this.saveSession(session);
-
-
-    if (partner) {
-
-      partner.partnerId = null;
-      partner.waiting = false;
-
-      this.saveSession(partner);
-
-      send(partner.ws, {
-        type: "partner_left",
-        reason,
-        message:
-          reason === "next"
-            ? "Your partner moved to the next person."
-            : "Chat ended."
-      });
-    }
-
-
-    send(session.ws, {
-      type: "ended",
-      reason
-    });
-  }
-
-
-  async report(
-    session,
-    reason
-  ) {
-
-    const record = {
-      id: crypto.randomUUID(),
-      reporter: session.id,
-      partner: session.partnerId,
-      reason,
-      createdAt:
-        new Date().toISOString()
-    };
-
-
-    /*
-     * Store report privately.
-     */
-    await this.ctx.storage.put(
-      "report:" + record.id,
-      record
-    );
-
-
-    send(session.ws, {
-      type: "reported",
-      message:
-        "Report submitted. Thank you."
-    });
-
-
-    /*
-     * End reported chat.
-     */
-    if (session.partnerId) {
-
-      const partner =
-        this.sessions.get(
-          session.partnerId
+          }
         );
 
-      if (partner) {
 
-        send(partner.ws, {
-          type: "partner_left",
-          reason: "report"
-        });
+        this.send(
+          partner,
+          {
 
-        partner.partnerId = null;
-        partner.waiting = false;
+            type:
+              "partner_left",
 
-        this.saveSession(partner);
+            message:
+              "Your partner moved to another person."
+
+          }
+        );
+
+
+        /*
+          Try to find another
+          person for partner.
+        */
+
+        const newPartner =
+          this.findMatch(
+            partner
+          );
+
+
+        if (newPartner) {
+
+          const newInfo =
+            this.getInfo(
+              newPartner
+            );
+
+
+          this.setInfo(
+            partner,
+            {
+
+              ...partnerInfo,
+
+              status:
+                "matched",
+
+              partnerId:
+                newInfo.id
+
+            }
+          );
+
+
+          this.setInfo(
+            newPartner,
+            {
+
+              ...newInfo,
+
+              status:
+                "matched",
+
+              partnerId:
+                partnerInfo.id
+
+            }
+          );
+
+
+          this.send(
+            partner,
+            {
+
+              type:
+                "matched",
+
+              role:
+                "caller",
+
+              mode:
+                "video",
+
+              partnerId:
+                newInfo.id
+
+            }
+          );
+
+
+          this.send(
+            newPartner,
+            {
+
+              type:
+                "matched",
+
+              role:
+                "callee",
+
+              mode:
+                "video",
+
+              partnerId:
+                partnerInfo.id
+
+            }
+          );
+        }
       }
 
 
-      session.partnerId = null;
-      session.waiting = false;
+      /*
+        Current user becomes waiting.
+      */
 
-      this.saveSession(session);
+      this.setInfo(
+        ws,
+        {
+
+          ...info,
+
+          status:
+            "waiting",
+
+          partnerId:
+            null
+
+        }
+      );
+
+
+      const match =
+        this.findMatch(ws);
+
+
+      if (match) {
+
+        const matchInfo =
+          this.getInfo(
+            match
+          );
+
+
+        this.setInfo(
+          ws,
+          {
+
+            ...info,
+
+            status:
+              "matched",
+
+            partnerId:
+              matchInfo.id
+
+          }
+        );
+
+
+        this.setInfo(
+          match,
+          {
+
+            ...matchInfo,
+
+            status:
+              "matched",
+
+            partnerId:
+              info.id
+
+          }
+        );
+
+
+        this.send(
+          ws,
+          {
+
+            type:
+              "matched",
+
+            role:
+              "caller",
+
+            mode:
+              "video",
+
+            partnerId:
+              matchInfo.id
+
+          }
+        );
+
+
+        this.send(
+          match,
+          {
+
+            type:
+              "matched",
+
+            role:
+              "callee",
+
+            mode:
+              "video",
+
+            partnerId:
+              info.id
+
+          }
+        );
+
+
+      } else {
+
+        this.send(
+          ws,
+          {
+
+            type:
+              "waiting",
+
+            message:
+              "Looking for another person..."
+
+          }
+        );
+      }
+
+
+      return;
     }
+
+
+    /* =====================================================
+       END
+    ===================================================== */
+
+    if (
+      data.type === "end"
+    ) {
+
+      const info =
+        this.getInfo(ws);
+
+
+      const partner =
+        info.partnerId
+          ? this.findById(
+              info.partnerId
+            )
+          : null;
+
+
+      if (partner) {
+
+        const partnerInfo =
+          this.getInfo(
+            partner
+          );
+
+
+        this.setInfo(
+          partner,
+          {
+
+            ...partnerInfo,
+
+            status:
+              "idle",
+
+            partnerId:
+              null
+
+          }
+        );
+
+
+        this.send(
+          partner,
+          {
+
+            type:
+              "partner_left",
+
+            message:
+              "Chat ended."
+
+          }
+        );
+      }
+
+
+      this.setInfo(
+        ws,
+        {
+
+          ...info,
+
+          status:
+            "idle",
+
+          partnerId:
+            null
+
+        }
+      );
+
+
+      return;
+    }
+
+
+    /* =====================================================
+       REPORT
+    ===================================================== */
+
+    if (
+      data.type ===
+      "report"
+    ) {
+
+      const info =
+        this.getInfo(ws);
+
+
+      const report = {
+
+        id:
+          crypto.randomUUID(),
+
+        createdAt:
+          new Date()
+            .toISOString(),
+
+        reason:
+          String(
+            data.reason ||
+            "Other"
+          )
+            .trim()
+            .slice(0, 100),
+
+        details:
+          String(
+            data.details ||
+            ""
+          )
+            .trim()
+            .slice(0, 500),
+
+        reporterId:
+          info.id ||
+          "unknown",
+
+        reportedUserId:
+          info.partnerId ||
+          "unknown",
+
+        mode:
+          "video",
+
+        country:
+          info.country ||
+          "unknown"
+
+      };
+
+
+      await this.ctx.storage.put(
+
+        "report:" +
+        report.id,
+
+        report
+
+      );
+
+
+      this.send(
+        ws,
+        {
+
+          type:
+            "report_success",
+
+          message:
+            "Report submitted successfully."
+
+        }
+      );
+
+
+      return;
+    }
+
+
+    /* =====================================================
+       PING
+    ===================================================== */
+
+    if (
+      data.type ===
+      "ping"
+    ) {
+
+      this.send(
+        ws,
+        {
+          type: "pong"
+        }
+      );
+    }
+  }
+
+
+  /* =======================================================
+     CLOSE
+  ======================================================= */
+
+  async webSocketClose(
+    ws
+  ) {
+
+    const info =
+      this.getInfo(ws);
+
+
+    const partner =
+      info.partnerId
+        ? this.findById(
+            info.partnerId
+          )
+        : null;
+
+
+    if (partner) {
+
+      const partnerInfo =
+        this.getInfo(
+          partner
+        );
+
+
+      this.setInfo(
+        partner,
+        {
+
+          ...partnerInfo,
+
+          status:
+            "idle",
+
+          partnerId:
+            null
+
+        }
+      );
+
+
+      this.send(
+        partner,
+        {
+
+          type:
+            "partner_left",
+
+          message:
+            "Your partner disconnected."
+
+        }
+      );
+    }
+  }
+
+
+  /* =======================================================
+     ERROR
+  ======================================================= */
+
+  async webSocketError(
+    ws,
+    error
+  ) {
+
+    console.error(
+      "WebSocket error:",
+      error
+    );
+
+
+    await this.webSocketClose(
+      ws
+    );
   }
 }
 
 
 /* =========================================================
-   FRONT END
+   MAIN WORKER
 ========================================================= */
 
-const APP_HTML = `<!doctype html>
+export default {
+
+  async fetch(
+    request,
+    env
+  ) {
+
+    const url =
+      new URL(
+        request.url
+      );
+
+
+    /* =========================
+       WEBSOCKET
+    ========================= */
+
+    if (
+      url.pathname ===
+      "/ws"
+    ) {
+
+      if (
+        request.headers.get(
+          "Upgrade"
+        )?.toLowerCase() !==
+        "websocket"
+      ) {
+
+        return new Response(
+          "WebSocket upgrade required.",
+          {
+            status: 426
+          }
+        );
+      }
+
+
+      /*
+        IMPORTANT:
+        This uses the existing
+        CHAT Durable Object
+        binding.
+      */
+
+      const id =
+        env.CHAT.idFromName(
+          "global-video-room"
+        );
+
+
+      const room =
+        env.CHAT.get(id);
+
+
+      return room.fetch(
+        request
+      );
+    }
+
+
+    /* =========================
+       HEALTH
+    ========================= */
+
+    if (
+      url.pathname ===
+      "/health"
+    ) {
+
+      return new Response(
+        JSON.stringify({
+
+          ok: true,
+
+          service:
+            "RandomTalk Video",
+
+          time:
+            new Date()
+              .toISOString()
+
+        }),
+        {
+
+          headers: {
+
+            "content-type":
+              "application/json"
+
+          }
+
+        }
+      );
+    }
+
+
+    /* =========================
+       WEBSITE
+    ========================= */
+
+    return new Response(
+      HTML_PAGE,
+      {
+
+        headers: {
+
+          "content-type":
+            "text/html; charset=UTF-8",
+
+          "cache-control":
+            "no-store"
+
+        }
+
+      }
+    );
+  }
+};
+
+
+/* =========================================================
+   WEBSITE
+========================================================= */
+
+const HTML_PAGE = `<!DOCTYPE html>
 
 <html lang="en">
 
@@ -770,15 +1301,15 @@ const APP_HTML = `<!doctype html>
 
 <meta
   name="viewport"
-  content="width=device-width,initial-scale=1,viewport-fit=cover"
+  content="width=device-width,initial-scale=1.0"
 >
 
 <meta
   name="theme-color"
-  content="#09071f"
+  content="#060817"
 >
 
-<title>RandomTalk</title>
+<title>RandomTalk Video</title>
 
 <style>
 
@@ -786,35 +1317,47 @@ const APP_HTML = `<!doctype html>
   box-sizing: border-box;
 }
 
-html,
-body {
-  margin: 0;
-  padding: 0;
-  min-height: 100%;
+html {
+  scroll-behavior: smooth;
 }
 
 body {
-  background:
-    radial-gradient(
-      circle at 20% 0%,
-      #24134d 0%,
-      #09071f 48%
-    );
 
-  color: #ffffff;
+  margin: 0;
+
+  min-height: 100vh;
+
+  background:
+
+    radial-gradient(
+      circle at 80% 10%,
+      rgba(124,58,237,.25),
+      transparent 32%
+    ),
+
+    radial-gradient(
+      circle at 10% 90%,
+      rgba(217,70,239,.15),
+      transparent 30%
+    ),
+
+    #050816;
+
+  color: white;
 
   font-family:
     Inter,
-    system-ui,
     -apple-system,
     BlinkMacSystemFont,
     "Segoe UI",
     sans-serif;
+
 }
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -822,407 +1365,733 @@ button {
   cursor: pointer;
 }
 
-header {
-  height: 70px;
+.container {
 
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-
-  padding: 0 20px;
-
-  border-bottom:
-    1px solid #2d2a54;
-
-  background:
-    rgba(9,7,31,.94);
-
-  position: sticky;
-  top: 0;
-
-  z-index: 20;
-}
-
-.logo {
-  font-size: 25px;
-  font-weight: 900;
-}
-
-.logo span {
-  color: #b34af2;
-}
-
-main {
-  max-width: 950px;
+  width:
+    min(
+      1050px,
+      calc(100% - 30px)
+    );
 
   margin: auto;
 
-  padding:
-    28px 16px 60px;
+}
+
+.navbar {
+
+  height: 72px;
+
+  display: flex;
+
+  align-items: center;
+
+  border-bottom:
+    1px solid
+    rgba(148,163,184,.14);
+
+}
+
+.nav-inner {
+
+  width:
+    min(
+      1050px,
+      calc(100% - 30px)
+    );
+
+  margin: auto;
+
+  display: flex;
+
+  align-items: center;
+
+  justify-content: space-between;
+
+}
+
+.logo {
+
+  font-size: 24px;
+
+  font-weight: 900;
+
+}
+
+.logo span {
+
+  color: #a855f7;
+
+}
+
+.nav-right {
+
+  color: #94a3b8;
+
+  font-size: 14px;
+
 }
 
 .hero {
+
   padding:
-    25px 0 10px;
+    55px 0 25px;
+
 }
 
 .hero h1 {
+
   margin: 0;
 
   font-size:
-    clamp(45px, 9vw, 78px);
+    clamp(
+      45px,
+      8vw,
+      76px
+    );
 
-  line-height: .94;
+  line-height: .95;
 
   letter-spacing: -4px;
+
 }
 
-.hero h1 span {
+.gradient {
+
   background:
     linear-gradient(
       90deg,
       #d946ef,
+      #7c3aed,
       #6366f1
     );
 
   -webkit-background-clip: text;
 
   color: transparent;
+
 }
 
 .hero p {
-  color: #aaa8c6;
 
-  max-width: 680px;
+  color: #aab5ca;
 
   font-size: 18px;
 
   line-height: 1.6;
+
+  max-width: 620px;
+
 }
 
 .card {
-  margin-top: 20px;
+
+  margin-bottom: 20px;
 
   padding: 18px;
 
-  background:
-    rgba(13,13,38,.94);
-
   border:
-    1px solid #2d2a54;
+    1px solid #26304a;
 
   border-radius: 22px;
 
-  box-shadow:
-    0 20px 60px rgba(0,0,0,.25);
-}
-
-.tabs {
-  display: grid;
-
-  grid-template-columns:
-    1fr 1fr;
-
-  gap: 10px;
-}
-
-.tab {
-  padding: 15px;
-
-  border:
-    1px solid #302d58;
-
-  border-radius: 15px;
-
-  background: transparent;
-
-  color: #aaa8c6;
-
-  font-weight: 800;
-}
-
-.tab.active {
-  color: white;
-
-  border-color: transparent;
-
   background:
-    linear-gradient(
-      90deg,
-      #c83de9,
-      #6366f1
-    );
+    rgba(8,15,32,.94);
+
 }
 
-.grid {
+.preferences {
+
   display: grid;
 
   grid-template-columns:
-    1fr 1fr;
+    1fr 1fr 1fr;
 
   gap: 12px;
 
-  margin-top: 16px;
 }
 
-label {
+.field label {
+
   display: block;
 
-  color: #aaa8c6;
+  margin-bottom: 7px;
+
+  color: #94a3b8;
 
   font-size: 13px;
 
-  margin-bottom: 7px;
 }
 
-input,
 select {
+
   width: 100%;
 
-  padding: 13px;
+  padding: 12px;
 
   border:
-    1px solid #302d58;
+    1px solid #303b59;
 
-  border-radius: 13px;
-
-  background: #08081a;
+  border-radius: 11px;
 
   color: white;
 
+  background: #111a2d;
+
   outline: none;
+
 }
 
-.actions {
+.buttons {
+
   display: flex;
 
   flex-wrap: wrap;
 
-  gap: 9px;
+  gap: 10px;
 
-  margin-top: 16px;
+  margin-top: 15px;
+
 }
 
 .btn {
-  border: 0;
-
-  border-radius: 13px;
 
   padding:
     13px 18px;
 
-  font-weight: 850;
+  border: 0;
+
+  border-radius: 12px;
 
   color: white;
+
+  font-weight: 800;
 
   background:
     linear-gradient(
       90deg,
-      #c83de9,
-      #6366f1
+      #d946ef,
+      #7c3aed
     );
+
 }
 
 .btn.secondary {
-  background: #181735;
+
+  background: #111a2d;
 
   border:
-    1px solid #302d58;
+    1px solid #303b59;
+
 }
 
 .btn.danger {
-  background: #3a1118;
+
+  background: #29111a;
+
+  color: #fb7185;
 
   border:
-    1px solid #70202a;
+    1px solid #5b2533;
 
-  color: #ffb5bc;
 }
 
 .btn:disabled {
+
   opacity: .45;
 
   cursor: not-allowed;
+
 }
 
 .status {
-  min-height: 25px;
 
-  margin-top: 14px;
+  margin-top: 15px;
 
-  color: #aaa8c6;
+  color: #fbbf24;
+
+  font-weight: 700;
+
 }
 
-.dot {
-  width: 9px;
+.status.connected {
 
-  height: 9px;
+  color: #4ade80;
 
-  display: inline-block;
-
-  border-radius: 50%;
-
-  background: #888;
-
-  margin-right: 8px;
 }
 
-.dot.ok {
-  background: #22c55e;
-}
+.video-container {
 
-.dot.wait {
-  background: #f59e0b;
-}
-
-.videos {
-  display: grid;
-
-  grid-template-columns:
-    1fr 1fr;
-
-  gap: 12px;
-}
-
-.videoBox {
   position: relative;
+
+  width: 100%;
+
+  aspect-ratio: 16 / 9;
+
+  min-height: 430px;
 
   overflow: hidden;
 
-  background: #020208;
+  border-radius: 20px;
+
+  background: #020617;
 
   border:
-    1px solid #302d58;
+    1px solid #303b59;
 
-  border-radius: 18px;
-
-  aspect-ratio: 16 / 10;
 }
 
-.videoBox video {
+#remoteVideo {
+
   width: 100%;
 
   height: 100%;
 
   object-fit: cover;
 
-  background: #020208;
+  background: #020617;
+
 }
 
-.videoLabel {
+.local-video {
+
   position: absolute;
 
-  top: 10px;
-  left: 10px;
+  right: 15px;
 
-  padding:
-    6px 9px;
+  bottom: 15px;
 
-  border-radius: 8px;
+  width: 190px;
 
-  background:
-    rgba(0,0,0,.65);
+  height: 140px;
 
-  font-size: 12px;
+  object-fit: cover;
+
+  border-radius: 14px;
+
+  background: #020617;
+
+  border:
+    2px solid #8b5cf6;
+
+  z-index: 4;
+
 }
 
-.chat {
-  height: 320px;
+.video-placeholder {
+
+  position: absolute;
+
+  inset: 0;
 
   display: flex;
 
   flex-direction: column;
+
+  align-items: center;
+
+  justify-content: center;
+
+  color: #94a3b8;
+
+  text-align: center;
+
+  z-index: 1;
+
 }
 
-.messages {
-  flex: 1;
+.video-placeholder-icon {
+
+  font-size: 60px;
+
+  margin-bottom: 12px;
+
+}
+
+.video-placeholder.hidden {
+
+  display: none;
+
+}
+
+.top-label {
+
+  position: absolute;
+
+  top: 15px;
+
+  left: 15px;
+
+  z-index: 6;
+
+  padding:
+    7px 11px;
+
+  border-radius: 9px;
+
+  background:
+    rgba(0,0,0,.55);
+
+  font-size: 13px;
+
+}
+
+.video-actions {
+
+  display: grid;
+
+  grid-template-columns:
+    repeat(3,1fr);
+
+  gap: 10px;
+
+  margin-top: 12px;
+
+}
+
+.video-button {
+
+  padding: 12px;
+
+  border:
+    1px solid #303b59;
+
+  border-radius: 11px;
+
+  color: white;
+
+  background: #111a2d;
+
+}
+
+.video-button.off {
+
+  color: #fb7185;
+
+  border-color: #6b2737;
+
+}
+
+
+/* =====================================================
+   MESSAGE OVERLAY
+===================================================== */
+
+.message-overlay {
+
+  position: absolute;
+
+  left: 15px;
+
+  right: 15px;
+
+  bottom: 15px;
+
+  z-index: 8;
+
+  pointer-events: none;
+
+}
+
+.message-list {
+
+  max-height: 160px;
 
   overflow-y: auto;
 
-  padding: 5px;
+  display: flex;
+
+  flex-direction: column;
+
+  gap: 6px;
+
+  margin-bottom: 8px;
+
 }
 
-.message {
+.overlay-message {
+
+  width: fit-content;
+
   max-width: 80%;
 
   padding:
-    10px 12px;
+    7px 11px;
 
-  margin:
-    7px 0;
+  border-radius: 12px;
 
-  border-radius: 14px;
+  background:
+    rgba(0,0,0,.68);
 
-  background: #19183b;
+  backdrop-filter:
+    blur(5px);
+
+  font-size: 14px;
+
+  line-height: 1.3;
+
 }
 
-.message.me {
-  margin-left: auto;
+.overlay-message.mine {
+
+  align-self: flex-end;
+
+  background:
+    rgba(99,55,180,.88);
+
+}
+
+.message-compose {
+
+  display: flex;
+
+  gap: 7px;
+
+  pointer-events: auto;
+
+}
+
+.message-compose input {
+
+  flex: 1;
+
+  min-width: 0;
+
+  padding:
+    11px 14px;
+
+  border:
+    1px solid
+    rgba(255,255,255,.25);
+
+  border-radius: 22px;
+
+  outline: none;
+
+  color: white;
+
+  background:
+    rgba(0,0,0,.72);
+
+  backdrop-filter:
+    blur(8px);
+
+}
+
+.message-compose button {
+
+  width: 46px;
+
+  height: 46px;
+
+  border: 0;
+
+  border-radius: 50%;
+
+  color: white;
 
   background:
     linear-gradient(
-      90deg,
-      #7136bd,
-      #4d52b8
+      135deg,
+      #d946ef,
+      #7c3aed
     );
+
 }
 
-.message small {
-  display: block;
 
-  color: #c8c4df;
+/* =====================================================
+   MODAL
+===================================================== */
 
-  margin-top: 3px;
+.modal {
+
+  position: fixed;
+
+  inset: 0;
+
+  z-index: 100;
+
+  display: none;
+
+  align-items: center;
+
+  justify-content: center;
+
+  padding: 20px;
+
+  background:
+    rgba(0,0,0,.78);
+
 }
 
-.compose {
+.modal.show {
+
   display: flex;
 
-  gap: 8px;
+}
+
+.modal-box {
+
+  width:
+    min(
+      420px,
+      100%
+    );
+
+  padding: 22px;
+
+  border:
+    1px solid #303b59;
+
+  border-radius: 18px;
+
+  background: #0b1222;
+
+}
+
+.modal-box h2 {
+
+  margin-top: 0;
+
+}
+
+.modal-box textarea {
+
+  width: 100%;
+
+  padding: 12px;
 
   margin-top: 10px;
+
+  resize: vertical;
+
+  border:
+    1px solid #303b59;
+
+  border-radius: 10px;
+
+  color: white;
+
+  background: #111a2d;
+
+  outline: none;
+
 }
 
-.compose input {
+.modal-buttons {
+
+  display: flex;
+
+  gap: 10px;
+
+  margin-top: 12px;
+
+}
+
+.modal-buttons button {
+
   flex: 1;
+
+  padding: 12px;
+
+  border: 0;
+
+  border-radius: 10px;
+
+  color: white;
+
 }
 
-.notice {
-  color: #aaa8c6;
+.cancel {
 
-  line-height: 1.5;
+  background: #182238;
 
-  font-size: 13px;
 }
 
-.hidden {
-  display: none !important;
+.submit {
+
+  background: #dc2626;
+
 }
 
-footer {
-  text-align: center;
 
-  color: #77758f;
+/* =====================================================
+   MOBILE
+===================================================== */
 
-  font-size: 12px;
+@media(max-width:700px) {
 
-  margin-top: 25px;
-}
+  .preferences {
 
-@media (max-width: 700px) {
-
-  .grid,
-  .videos {
     grid-template-columns: 1fr;
+
+  }
+
+  .hero {
+
+    padding-top: 35px;
+
   }
 
   .hero h1 {
+
     letter-spacing: -2px;
+
   }
 
-  .videoBox {
-    aspect-ratio: 4 / 3;
+  .video-container {
+
+    min-height: 430px;
+
+    aspect-ratio: 9 / 16;
+
   }
+
+  .local-video {
+
+    width: 110px;
+
+    height: 145px;
+
+    right: 10px;
+
+    top: 10px;
+
+    bottom: auto;
+
+  }
+
+  .video-actions {
+
+    grid-template-columns:
+      1fr 1fr;
+
+  }
+
+  .video-actions
+  button:last-child {
+
+    grid-column:
+      1 / -1;
+
+  }
+
+  .message-overlay {
+
+    bottom: 10px;
+
+    left: 10px;
+
+    right: 10px;
+
+  }
+
+  .message-list {
+
+    max-height: 130px;
+
+  }
+
 }
 
 </style>
@@ -1233,70 +2102,96 @@ footer {
 <body>
 
 
-<header>
+<header class="navbar">
+
+<div class="nav-inner">
 
 <div class="logo">
-Random<span>Talk</span>
+
+💬 Random<span>Talk</span>
+
 </div>
 
-<div>
-Text & Video Chat
+<div class="nav-right">
+
+Video Chat
+
+</div>
+
 </div>
 
 </header>
 
 
-<main>
+<main class="container">
 
 
 <section class="hero">
 
 <h1>
+
 Talk to<br>
-someone <span>new.</span>
+
+someone
+
+<span class="gradient">
+new.
+</span>
+
 </h1>
 
 <p>
-Meet random people through text or video chat.
-Choose your preferences and move to the next
-person whenever you want.
+
+Meet a random person through live video chat.
+If your microphone is off, you can still type
+messages directly on the video screen.
+
 </p>
 
 </section>
 
 
+<!-- =====================================================
+     PREFERENCES
+===================================================== -->
+
 <section class="card">
 
+<div class="preferences">
 
-<div class="tabs">
 
-<button
-  id="textTab"
-  class="tab active"
->
-Text Chat
-</button>
+<div class="field">
 
-<button
-  id="videoTab"
-  class="tab"
->
-Video Chat
-</button>
+<label>
+My gender
+</label>
+
+<select id="myGender">
+
+<option value="male">
+Male
+</option>
+
+<option value="female">
+Female
+</option>
+
+<option value="other">
+Other
+</option>
+
+</select>
 
 </div>
 
 
-<div class="grid">
-
-
-<div>
+<div class="field">
 
 <label>
-Gender preference
+Chat with
 </label>
 
-<select id="gender">
+<select id="preferredGender">
 
 <option value="any">
 Anyone
@@ -1319,17 +2214,51 @@ Other
 </div>
 
 
-<div>
+<div class="field">
 
 <label>
-Country preference
+Country
 </label>
 
-<input
-  id="country"
-  maxlength="60"
-  placeholder="any"
->
+<select id="country">
+
+<option value="any">
+Any country
+</option>
+
+<option value="india">
+India 🇮🇳
+</option>
+
+<option value="usa">
+United States 🇺🇸
+</option>
+
+<option value="uk">
+United Kingdom 🇬🇧
+</option>
+
+<option value="canada">
+Canada 🇨🇦
+</option>
+
+<option value="australia">
+Australia 🇦🇺
+</option>
+
+<option value="germany">
+Germany 🇩🇪
+</option>
+
+<option value="france">
+France 🇫🇷
+</option>
+
+<option value="any">
+Other / Any
+</option>
+
+</select>
 
 </div>
 
@@ -1337,162 +2266,177 @@ Country preference
 </div>
 
 
-<div class="actions">
+<div class="buttons">
 
 <button
-  id="findBtn"
-  class="btn"
+id="startBtn"
+class="btn"
 >
-Start Chatting
+🚀 Start Video Chat
 </button>
 
-<button
-  id="nextBtn"
-  class="btn secondary"
-  disabled
->
-Next
-</button>
 
 <button
-  id="endBtn"
-  class="btn danger"
-  disabled
+id="nextBtn"
+class="btn secondary"
+disabled
 >
-End
+⏭ Next
 </button>
 
+
 <button
-  id="reportBtn"
-  class="btn secondary"
-  disabled
+id="endBtn"
+class="btn danger"
+disabled
 >
-Report
+⏹ End
+</button>
+
+
+<button
+id="reportBtn"
+class="btn secondary"
+disabled
+>
+⚠ Report
 </button>
 
 </div>
 
 
 <div
-  id="status"
-  class="status"
+id="status"
+class="status"
 >
-<span class="dot"></span>
-Ready
+● Ready — press Start Video Chat
 </div>
 
 
 </section>
 
 
-<section
-  id="videoCard"
-  class="card hidden"
->
-
-
-<div class="videos">
-
-
-<div class="videoBox">
-
-<video
-  id="localVideo"
-  autoplay
-  muted
-  playsinline
-></video>
-
-<div class="videoLabel">
-You
-</div>
-
-</div>
-
-
-<div class="videoBox">
-
-<video
-  id="remoteVideo"
-  autoplay
-  playsinline
-></video>
-
-<div class="videoLabel">
-Stranger
-</div>
-
-</div>
-
-
-</div>
-
-
-<div class="actions">
-
-
-<button
-  id="camBtn"
-  class="btn secondary"
->
-Camera
-</button>
-
-
-<button
-  id="micBtn"
-  class="btn secondary"
->
-Microphone
-</button>
-
-
-<button
-  id="restartBtn"
-  class="btn secondary"
->
-Reconnect Video
-</button>
-
-
-</div>
-
-
-</section>
-
+<!-- =====================================================
+     VIDEO
+===================================================== -->
 
 <section
-  id="chatCard"
-  class="card hidden"
+id="videoCard"
+class="card"
+style="display:none"
 >
 
 
-<div class="chat">
+<div class="video-container">
 
 
 <div
-  id="messages"
-  class="messages"
+id="topLabel"
+class="top-label"
+>
+🎥 RandomTalk
+</div>
+
+
+<video
+id="remoteVideo"
+autoplay
+playsinline
+></video>
+
+
+<video
+id="localVideo"
+class="local-video"
+autoplay
+muted
+playsinline
+></video>
+
+
+<div
+id="videoPlaceholder"
+class="video-placeholder"
+>
+
+<div
+class="video-placeholder-icon"
+>
+🎥
+</div>
+
+<div
+id="placeholderText"
+>
+Waiting for another person...
+</div>
+
+</div>
+
+
+<!-- =====================================================
+     IN VIDEO MESSAGES
+===================================================== -->
+
+<div class="message-overlay">
+
+
+<div
+id="messageList"
+class="message-list"
 >
 </div>
 
 
-<div class="compose">
+<div class="message-compose">
 
 <input
-  id="chatInput"
-  maxlength="2000"
-  placeholder="Type a message..."
+id="messageInput"
+maxlength="500"
+placeholder="Type a message..."
 >
 
+
 <button
-  id="sendBtn"
-  class="btn"
+id="sendMessage"
 >
-Send
+➤
 </button>
 
 </div>
+
+
+</div>
+
+
+</div>
+
+
+<div class="video-actions">
+
+
+<button
+id="cameraBtn"
+class="video-button"
+>
+📷 Camera On
+</button>
+
+
+<button
+id="micBtn"
+class="video-button"
+>
+🎤 Microphone On
+</button>
+
+
+<button
+id="reconnectBtn"
+class="video-button"
+>
+🔄 Reconnect Video
+</button>
 
 
 </div>
@@ -1503,580 +2447,1665 @@ Send
 
 <section class="card">
 
-<div class="notice">
+<div style="
+color:#94a3b8;
+line-height:1.7;
+font-size:13px;
+">
 
-<strong>
-Safety:
-</strong>
+<b style="color:white">
+Safety
+</b>
 
-Be respectful. Never share passwords,
-bank information, exact addresses, or
-other sensitive personal information.
+<br>
+
+• Be respectful.
+
+<br>
+
+• Do not share passwords or financial information.
+
+<br>
+
+• Do not share your exact home address.
+
+<br>
+
+• Use Report if someone behaves inappropriately.
 
 </div>
 
 </section>
 
 
-<footer>
-RandomTalk
-</footer>
-
-
 </main>
+
+
+<!-- =====================================================
+     REPORT MODAL
+===================================================== -->
+
+<div
+id="reportModal"
+class="modal"
+>
+
+<div class="modal-box">
+
+<h2>
+⚠ Report User
+</h2>
+
+<p style="color:#94a3b8">
+Tell us what happened.
+</p>
+
+
+<select id="reportReason">
+
+<option value="Harassment">
+Harassment
+</option>
+
+<option value="Sexual content">
+Sexual content
+</option>
+
+<option value="Hate or abuse">
+Hate or abuse
+</option>
+
+<option value="Spam">
+Spam
+</option>
+
+<option value="Scam">
+Scam
+</option>
+
+<option value="Inappropriate behavior">
+Inappropriate behavior
+</option>
+
+<option value="Other">
+Other
+</option>
+
+</select>
+
+
+<textarea
+id="reportDetails"
+rows="4"
+maxlength="500"
+placeholder="Optional details..."
+></textarea>
+
+
+<div class="modal-buttons">
+
+<button
+id="cancelReport"
+class="cancel"
+>
+Cancel
+</button>
+
+
+<button
+id="submitReport"
+class="submit"
+>
+Submit
+</button>
+
+</div>
+
+</div>
+
+</div>
 
 
 <script>
 
-(() => {
-
 "use strict";
 
 
-/* =====================================================
+/* =========================================================
    STATE
-===================================================== */
+========================================================= */
 
-let ws = null;
+let socket = null;
 
-let mode = "text";
+let currentMode = "video";
 
-let myId = null;
+let connected = false;
 
-let partnerConnected = false;
-
-let role = null;
-
-let peer = null;
+let isInitiator = false;
 
 let localStream = null;
 
-let iceQueue = [];
+let peerConnection = null;
 
-let reconnectTimer = null;
+let pendingIce = [];
+
+let cameraEnabled = true;
+
+let microphoneEnabled = true;
 
 let manualClose = false;
 
 
-/* =====================================================
-   HELPERS
-===================================================== */
+/* =========================================================
+   WEBRTC
+========================================================= */
 
-function $(id) {
-  return document.getElementById(id);
-}
+const rtcConfig = {
 
+  iceServers: [
 
-function escapeHTML(value) {
+    {
+      urls:
+        "stun:stun.l.google.com:19302"
+    },
 
-  return String(value).replace(
-    /[&<>"']/g,
-    function(c) {
+    {
+      urls:
+        "stun:stun1.l.google.com:19302"
+    },
 
-      return {
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;"
-      }[c];
-
+    {
+      urls:
+        "stun:stun2.l.google.com:19302"
     }
-  );
-}
 
+  ],
+
+  iceCandidatePoolSize: 10
+
+};
+
+
+/* =========================================================
+   ELEMENTS
+========================================================= */
+
+const startBtn =
+  document.getElementById(
+    "startBtn"
+  );
+
+const nextBtn =
+  document.getElementById(
+    "nextBtn"
+  );
+
+const endBtn =
+  document.getElementById(
+    "endBtn"
+  );
+
+const reportBtn =
+  document.getElementById(
+    "reportBtn"
+  );
+
+const videoCard =
+  document.getElementById(
+    "videoCard"
+  );
+
+const remoteVideo =
+  document.getElementById(
+    "remoteVideo"
+  );
+
+const localVideo =
+  document.getElementById(
+    "localVideo"
+  );
+
+const videoPlaceholder =
+  document.getElementById(
+    "videoPlaceholder"
+  );
+
+const placeholderText =
+  document.getElementById(
+    "placeholderText"
+  );
+
+const statusEl =
+  document.getElementById(
+    "status"
+  );
+
+const messageInput =
+  document.getElementById(
+    "messageInput"
+  );
+
+const messageList =
+  document.getElementById(
+    "messageList"
+  );
+
+
+/* =========================================================
+   STATUS
+========================================================= */
 
 function setStatus(
   text,
-  type = ""
+  good = false
 ) {
 
-  $("status").innerHTML =
-    '<span class="dot ' +
-    type +
-    '"></span>' +
-    escapeHTML(text);
+  statusEl.textContent =
+    "● " + text;
+
+  if (good) {
+
+    statusEl.classList.add(
+      "connected"
+    );
+
+  } else {
+
+    statusEl.classList.remove(
+      "connected"
+    );
+  }
 }
 
 
-function getPrefs() {
+/* =========================================================
+   SOCKET
+========================================================= */
 
-  return {
+function connectSocket() {
 
-    gender:
-      $("gender").value,
+  if (
+    socket &&
+    (
+      socket.readyState ===
+      WebSocket.OPEN ||
 
-    country:
-      $("country").value.trim() ||
-      "any",
+      socket.readyState ===
+      WebSocket.CONNECTING
+    )
+  ) {
 
-    mode
-  };
-}
+    return;
+  }
 
-
-function websocketURL() {
 
   const protocol =
-    location.protocol === "https:"
+    location.protocol ===
+    "https:"
       ? "wss:"
       : "ws:";
 
-  return (
-    protocol +
-    "//" +
-    location.host +
-    "/ws"
-  );
+
+  socket =
+    new WebSocket(
+
+      protocol +
+      "//" +
+      location.host +
+      "/ws"
+
+    );
+
+
+  socket.onopen =
+    () => {
+
+      setStatus(
+        "Connected. Looking for a stranger..."
+      );
+
+      joinRoom();
+
+    };
+
+
+  socket.onmessage =
+    async event => {
+
+      let data;
+
+
+      try {
+
+        data =
+          JSON.parse(
+            event.data
+          );
+
+      } catch {
+
+        return;
+      }
+
+
+      await handleMessage(
+        data
+      );
+    };
+
+
+  socket.onerror =
+    () => {
+
+      setStatus(
+        "Connection error."
+      );
+    };
+
+
+  socket.onclose =
+    () => {
+
+      connected = false;
+
+      closePeerConnection();
+
+      if (!manualClose) {
+
+        setStatus(
+          "Disconnected. Press Start to reconnect."
+        );
+
+      }
+
+      updateButtons();
+
+    };
 }
 
 
-/* =====================================================
-   WEBSOCKET
-===================================================== */
+/* =========================================================
+   JOIN
+========================================================= */
 
-function connect() {
-
-  manualClose = false;
+function joinRoom() {
 
   if (
-    ws &&
-    (
-      ws.readyState === WebSocket.OPEN ||
-      ws.readyState === WebSocket.CONNECTING
-    )
+    !socket ||
+    socket.readyState !==
+    WebSocket.OPEN
   ) {
+
     return;
   }
 
 
-  setStatus(
-    "Connecting...",
-    "wait"
+  const gender =
+    document.getElementById(
+      "myGender"
+    ).value;
+
+
+  const preferredGender =
+    document.getElementById(
+      "preferredGender"
+    ).value;
+
+
+  const country =
+    document.getElementById(
+      "country"
+    ).value;
+
+
+  socket.send(
+
+    JSON.stringify({
+
+      type:
+        "join",
+
+      mode:
+        "video",
+
+      gender,
+
+      preferredGender,
+
+      country
+
+    })
+
   );
+}
 
 
-  ws = new WebSocket(
-    websocketURL()
-  );
+/* =========================================================
+   SERVER MESSAGE
+========================================================= */
+
+async function handleMessage(
+  data
+) {
 
 
-  ws.onopen = () => {
+  /* =========================
+     WAITING
+  ========================= */
+
+  if (
+    data.type ===
+    "waiting"
+  ) {
+
+    connected = false;
 
     setStatus(
-      "Connected.",
-      "ok"
+      "Looking for another person..."
     );
 
-    ws.send(
-      JSON.stringify({
-        type: "prefs",
-        prefs: getPrefs()
-      })
+    placeholderText.textContent =
+      "Waiting for another person...";
+
+    updateButtons();
+
+    return;
+  }
+
+
+  /* =========================
+     MATCHED
+  ========================= */
+
+  if (
+    data.type ===
+    "matched"
+  ) {
+
+    connected = true;
+
+    isInitiator =
+      data.role ===
+      "caller";
+
+
+    clearMessages();
+
+
+    videoCard.style.display =
+      "block";
+
+
+    placeholderText.textContent =
+      "Connecting video...";
+
+
+    videoPlaceholder.classList
+      .remove("hidden");
+
+
+    setStatus(
+      "Stranger found — starting video...",
+      true
     );
-  };
 
 
-  ws.onmessage = async event => {
+    updateButtons();
 
-    let data;
 
     try {
 
-      data =
-        JSON.parse(event.data);
+      await startVideo();
 
-    } catch {
 
-      return;
+    } catch (error) {
+
+      console.error(
+        "Video start error:",
+        error
+      );
+
+
+      setStatus(
+        "Camera or microphone permission failed."
+      );
+
+      placeholderText.textContent =
+        "Camera/microphone permission is required.";
     }
 
-    await handleServer(data);
-  };
+
+    return;
+  }
 
 
-  ws.onerror = () => {
+  /* =========================
+     CHAT MESSAGE
+  ========================= */
+
+  if (
+    data.type ===
+    "chat"
+  ) {
+
+    addMessage(
+      data.text,
+      false
+    );
+
+    return;
+  }
+
+
+  /* =========================
+     SIGNAL
+  ========================= */
+
+  if (
+    data.type ===
+    "signal"
+  ) {
+
+    try {
+
+      await handleSignal(
+        data.signal
+      );
+
+    } catch (error) {
+
+      console.error(
+        "Signal error:",
+        error
+      );
+    }
+
+    return;
+  }
+
+
+  /* =========================
+     PARTNER LEFT
+  ========================= */
+
+  if (
+    data.type ===
+    "partner_left"
+  ) {
+
+    connected = false;
+
+    closePeerConnection();
+
+    clearMessages();
+
+    placeholderText.textContent =
+      "Your partner left. Press Next.";
+
+
+    videoPlaceholder.classList
+      .remove("hidden");
+
 
     setStatus(
-      "Connection error. Retrying...",
-      "wait"
+      "Stranger left."
     );
-  };
 
 
-  ws.onclose = () => {
+    updateButtons();
 
-    partnerConnected = false;
-
-    if (!manualClose) {
-
-      setStatus(
-        "Disconnected. Reconnecting...",
-        "wait"
-      );
-
-      clearTimeout(
-        reconnectTimer
-      );
-
-      reconnectTimer =
-        setTimeout(
-          connect,
-          1200
-        );
-    }
-  };
-}
-
-
-/* =====================================================
-   SERVER EVENTS
-===================================================== */
-
-async function handleServer(data) {
-
-  switch (data.type) {
-
-
-    case "hello":
-
-      myId = data.id;
-
-      break;
-
-
-    case "searching":
-
-      setStatus(
-        "Looking for someone...",
-        "wait"
-      );
-
-      setButtons(true);
-
-      break;
-
-
-    case "matched":
-
-      partnerConnected = true;
-
-      role = data.role;
-
-      setStatus(
-        "Connected to a stranger.",
-        "ok"
-      );
-
-      setButtons(false);
-
-
-      if (mode === "text") {
-
-        $("chatCard")
-          .classList
-          .remove("hidden");
-
-      }
-
-
-      if (mode === "video") {
-
-        $("videoCard")
-          .classList
-          .remove("hidden");
-
-        await startVideo(
-          role === "caller"
-        );
-      }
-
-      break;
-
-
-    case "chat":
-
-      addMessage(
-        data.text,
-        false
-      );
-
-      break;
-
-
-    case "offer":
-
-      await handleOffer(
-        data.data
-      );
-
-      break;
-
-
-    case "answer":
-
-      await handleAnswer(
-        data.data
-      );
-
-      break;
-
-
-    case "candidate":
-
-      await handleCandidate(
-        data.data
-      );
-
-      break;
-
-
-    case "partner_left":
-
-      await cleanupVideo();
-
-      partnerConnected = false;
-
-      $("chatCard")
-        .classList
-        .add("hidden");
-
-      $("videoCard")
-        .classList
-        .add("hidden");
-
-      setButtons(false);
-
-      setStatus(
-        "Partner left. Tap Next to find another person.",
-        "wait"
-      );
-
-      break;
-
-
-    case "ended":
-
-      await cleanupVideo();
-
-      partnerConnected = false;
-
-      $("chatCard")
-        .classList
-        .add("hidden");
-
-      $("videoCard")
-        .classList
-        .add("hidden");
-
-      setButtons(false);
-
-      setStatus(
-        "Chat ended."
-      );
-
-      break;
-
-
-    case "reported":
-
-      setStatus(
-        "Report submitted.",
-        "ok"
-      );
-
-      break;
-
-
-    case "signal_error":
-
-      setStatus(
-        data.message ||
-        "Video signaling error.",
-        "wait"
-      );
-
-      break;
+    return;
   }
-}
 
 
-/* =====================================================
-   BUTTON STATE
-===================================================== */
-
-function setButtons(searching) {
-
-  $("findBtn").disabled =
-    searching ||
-    partnerConnected;
-
-  $("nextBtn").disabled =
-    !searching &&
-    !partnerConnected;
-
-  $("endBtn").disabled =
-    !searching &&
-    !partnerConnected;
-
-  $("reportBtn").disabled =
-    !partnerConnected;
-}
-
-
-/* =====================================================
-   FIND
-===================================================== */
-
-function findPerson() {
+  /* =========================
+     REPORT
+  ========================= */
 
   if (
-    !ws ||
-    ws.readyState !== WebSocket.OPEN
+    data.type ===
+    "report_success"
   ) {
 
-    connect();
+    closeReport();
 
-    setTimeout(
-      findPerson,
-      800
+    alert(
+      "Report submitted successfully."
     );
 
     return;
   }
 
 
-  cleanupVideo();
+  /* =========================
+     ERROR
+  ========================= */
 
+  if (
+    data.type ===
+    "error"
+  ) {
 
-  partnerConnected = false;
-
-
-  $("messages").innerHTML = "";
-
-
-  $("chatCard")
-    .classList
-    .add("hidden");
-
-  $("videoCard")
-    .classList
-    .add("hidden");
-
-
-  ws.send(
-    JSON.stringify({
-      type: "find",
-      prefs: getPrefs()
-    })
-  );
-
-
-  setStatus(
-    "Looking for someone...",
-    "wait"
-  );
-
-
-  setButtons(true);
+    setStatus(
+      data.message ||
+      "Something went wrong."
+    );
+  }
 }
 
 
-/* =====================================================
+/* =========================================================
+   START
+========================================================= */
+
+function startChat() {
+
+  manualClose = false;
+
+
+  if (
+    !socket ||
+    socket.readyState !==
+    WebSocket.OPEN
+  ) {
+
+    connectSocket();
+
+    return;
+  }
+
+
+  joinRoom();
+}
+
+
+/* =========================================================
    NEXT
-===================================================== */
+========================================================= */
 
-function nextPerson() {
+function nextChat() {
 
   if (
-    !ws ||
-    ws.readyState !== WebSocket.OPEN
+    !socket ||
+    socket.readyState !==
+    WebSocket.OPEN
   ) {
+
     return;
   }
 
 
-  cleanupVideo();
+  connected = false;
 
 
-  partnerConnected = false;
+  closePeerConnection();
+
+  clearMessages();
 
 
-  $("messages").innerHTML = "";
+  placeholderText.textContent =
+    "Looking for another person...";
 
 
-  $("chatCard")
-    .classList
-    .add("hidden");
-
-  $("videoCard")
-    .classList
-    .add("hidden");
-
-
-  ws.send(
-    JSON.stringify({
-      type: "next"
-    })
-  );
+  videoPlaceholder.classList
+    .remove("hidden");
 
 
   setStatus(
-    "Looking for the next person...",
-    "wait"
+    "Looking for another person..."
   );
 
 
-  setButtons(true);
+  socket.send(
+
+    JSON.stringify({
+
+      type:
+        "next"
+
+    })
+
+  );
+
+
+  updateButtons();
 }
 
 
-/* =====================================================
+/* =========================================================
    END
-===================================================== */
+========================================================= */
 
 function endChat() {
 
   if (
-    ws &&
-    ws.readyState === WebSocket.OPEN
+    socket &&
+    socket.readyState ===
+    WebSocket.OPEN
   ) {
 
-    ws.send(
+    socket.send(
+
       JSON.stringify({
-        type: "end"
+
+        type:
+          "end"
+
       })
+
     );
   }
 
 
-  cleanupVideo();
+  connected = false;
 
 
-  partnerConnected = false;
+  closePeerConnection();
+
+  clearMessages();
 
 
-  $("chatCard")
-    .classList
-    .add("hidden");
-
-  $("videoCard")
-    .classList
-    .add("hidden");
+  videoPlaceholder.classList
+    .remove("hidden");
 
 
-  setButtons(false);
+  placeholderText.textContent =
+    "Chat ended.";
 
 
   setStatus(
     "Chat ended."
   );
+
+
+  updateButtons();
 }
 
 
-/* =====================================================
-   TEXT CHAT
-===================================================== */
+/* =========================================================
+   BUTTON STATE
+========================================================= */
+
+function updateButtons() {
+
+  startBtn.disabled =
+    connected;
+
+
+  nextBtn.disabled =
+    !connected;
+
+
+  endBtn.disabled =
+    !connected;
+
+
+  reportBtn.disabled =
+    !connected;
+}
+
+
+/* =========================================================
+   CAMERA + MICROPHONE
+========================================================= */
+
+async function getLocalMedia() {
+
+  if (localStream) {
+
+    return localStream;
+  }
+
+
+  if (
+    !navigator.mediaDevices ||
+    !navigator.mediaDevices.getUserMedia
+  ) {
+
+    throw new Error(
+      "Camera API unavailable."
+    );
+  }
+
+
+  localStream =
+    await navigator.mediaDevices
+      .getUserMedia({
+
+        video: {
+
+          facingMode:
+            "user",
+
+          width: {
+            ideal: 1280
+          },
+
+          height: {
+            ideal: 720
+          },
+
+          frameRate: {
+            ideal: 30
+          }
+
+        },
+
+        audio: {
+
+          echoCancellation:
+            true,
+
+          noiseSuppression:
+            true,
+
+          autoGainControl:
+            true
+
+        }
+
+      });
+
+
+  localVideo.srcObject =
+    localStream;
+
+
+  localVideo.muted =
+    true;
+
+
+  await localVideo
+    .play()
+    .catch(
+      () => {}
+    );
+
+
+  cameraEnabled =
+    true;
+
+  microphoneEnabled =
+    true;
+
+
+  updateMediaButtons();
+
+
+  return localStream;
+}
+
+
+/* =========================================================
+   PEER CONNECTION
+========================================================= */
+
+async function createPeerConnection() {
+
+  if (peerConnection) {
+
+    return peerConnection;
+  }
+
+
+  peerConnection =
+    new RTCPeerConnection(
+      rtcConfig
+    );
+
+
+  /*
+    Add local tracks.
+  */
+
+  if (localStream) {
+
+    for (
+      const track
+      of localStream.getTracks()
+    ) {
+
+      peerConnection.addTrack(
+        track,
+        localStream
+      );
+    }
+  }
+
+
+  /*
+    Remote video.
+  */
+
+  peerConnection.ontrack =
+    event => {
+
+      const stream =
+        event.streams &&
+        event.streams[0];
+
+
+      if (!stream) {
+        return;
+      }
+
+
+      remoteVideo.srcObject =
+        stream;
+
+
+      remoteVideo
+        .play()
+        .catch(
+          () => {}
+        );
+
+
+      videoPlaceholder.classList
+        .add("hidden");
+
+
+      setStatus(
+        "Video connected.",
+        true
+      );
+    };
+
+
+  /*
+    ICE candidates.
+  */
+
+  peerConnection.onicecandidate =
+    event => {
+
+      if (
+        !event.candidate
+      ) {
+
+        return;
+      }
+
+
+      sendSignal({
+
+        type:
+          "ice",
+
+        candidate:
+          event.candidate
+
+      });
+    };
+
+
+  /*
+    Connection state.
+  */
+
+  peerConnection
+    .onconnectionstatechange =
+    () => {
+
+      if (!peerConnection) {
+        return;
+      }
+
+
+      const state =
+        peerConnection
+          .connectionState;
+
+
+      if (
+        state ===
+        "connected"
+      ) {
+
+        setStatus(
+          "Video connected.",
+          true
+        );
+
+        videoPlaceholder
+          .classList
+          .add("hidden");
+      }
+
+
+      if (
+        state ===
+        "connecting"
+      ) {
+
+        setStatus(
+          "Connecting video..."
+        );
+      }
+
+
+      if (
+        state ===
+        "disconnected"
+      ) {
+
+        setStatus(
+          "Video connection unstable. Reconnecting..."
+        );
+
+        setTimeout(
+          restartVideo,
+          1000
+        );
+      }
+
+
+      if (
+        state ===
+        "failed"
+      ) {
+
+        setStatus(
+          "Video connection failed. Reconnecting..."
+        );
+
+        setTimeout(
+          restartVideo,
+          300
+        );
+      }
+    };
+
+
+  /*
+    ICE state.
+  */
+
+  peerConnection
+    .oniceconnectionstatechange =
+    () => {
+
+      if (
+        !peerConnection
+      ) {
+
+        return;
+      }
+
+
+      const state =
+        peerConnection
+          .iceConnectionState;
+
+
+      if (
+        state ===
+        "failed"
+      ) {
+
+        restartVideo();
+      }
+    };
+
+
+  return peerConnection;
+}
+
+
+/* =========================================================
+   START VIDEO
+========================================================= */
+
+async function startVideo() {
+
+  await getLocalMedia();
+
+
+  await createPeerConnection();
+
+
+  if (isInitiator) {
+
+    const offer =
+      await peerConnection
+        .createOffer();
+
+
+    await peerConnection
+      .setLocalDescription(
+        offer
+      );
+
+
+    sendSignal({
+
+      type:
+        "offer",
+
+      sdp:
+        peerConnection
+          .localDescription
+
+    });
+  }
+}
+
+
+/* =========================================================
+   SIGNAL
+========================================================= */
+
+function sendSignal(
+  signal
+) {
+
+  if (
+    !socket ||
+    socket.readyState !==
+    WebSocket.OPEN ||
+    !connected
+  ) {
+
+    return;
+  }
+
+
+  socket.send(
+
+    JSON.stringify({
+
+      type:
+        "signal",
+
+      signal
+
+    })
+
+  );
+}
+
+
+async function handleSignal(
+  signal
+) {
+
+  if (!signal) {
+    return;
+  }
+
+
+  /*
+    Make sure local media
+    exists before answering.
+  */
+
+  if (
+    !peerConnection
+  ) {
+
+    await getLocalMedia();
+
+    await createPeerConnection();
+  }
+
+
+  /* =========================
+     OFFER
+  ========================= */
+
+  if (
+    signal.type ===
+    "offer"
+  ) {
+
+    await peerConnection
+      .setRemoteDescription(
+
+        new RTCSessionDescription(
+          signal.sdp
+        )
+
+      );
+
+
+    await flushIce();
+
+
+    const answer =
+      await peerConnection
+        .createAnswer();
+
+
+    await peerConnection
+      .setLocalDescription(
+        answer
+      );
+
+
+    sendSignal({
+
+      type:
+        "answer",
+
+      sdp:
+        peerConnection
+          .localDescription
+
+    });
+
+
+    return;
+  }
+
+
+  /* =========================
+     ANSWER
+  ========================= */
+
+  if (
+    signal.type ===
+    "answer"
+  ) {
+
+    await peerConnection
+      .setRemoteDescription(
+
+        new RTCSessionDescription(
+          signal.sdp
+        )
+
+      );
+
+
+    await flushIce();
+
+
+    return;
+  }
+
+
+  /* =========================
+     ICE
+  ========================= */
+
+  if (
+    signal.type ===
+    "ice"
+  ) {
+
+    const candidate =
+      signal.candidate;
+
+
+    if (!candidate) {
+      return;
+    }
+
+
+    if (
+      peerConnection
+        .remoteDescription
+    ) {
+
+      try {
+
+        await peerConnection
+          .addIceCandidate(
+            new RTCIceCandidate(
+              candidate
+            )
+          );
+
+      } catch (error) {
+
+        console.error(
+          "ICE error:",
+          error
+        );
+      }
+
+
+    } else {
+
+      pendingIce.push(
+        candidate
+      );
+    }
+  }
+}
+
+
+/* =========================================================
+   FLUSH ICE
+========================================================= */
+
+async function flushIce() {
+
+  if (
+    !peerConnection
+  ) {
+
+    return;
+  }
+
+
+  const list =
+    pendingIce;
+
+
+  pendingIce = [];
+
+
+  for (
+    const candidate
+    of list
+  ) {
+
+    try {
+
+      await peerConnection
+        .addIceCandidate(
+
+          new RTCIceCandidate(
+            candidate
+          )
+
+        );
+
+    } catch {}
+  }
+}
+
+
+/* =========================================================
+   RESTART VIDEO
+========================================================= */
+
+async function restartVideo() {
+
+  if (!connected) {
+    return;
+  }
+
+
+  try {
+
+    if (!localStream) {
+
+      await getLocalMedia();
+    }
+
+
+    if (!peerConnection) {
+
+      await createPeerConnection();
+    }
+
+
+    /*
+      Only caller creates
+      the ICE restart offer.
+    */
+
+    if (isInitiator) {
+
+      const offer =
+        await peerConnection
+          .createOffer({
+
+            iceRestart:
+              true
+
+          });
+
+
+      await peerConnection
+        .setLocalDescription(
+          offer
+        );
+
+
+      sendSignal({
+
+        type:
+          "offer",
+
+        sdp:
+          peerConnection
+            .localDescription
+
+      });
+    }
+
+  } catch (error) {
+
+    console.error(
+      "Restart video error:",
+      error
+    );
+  }
+}
+
+
+/* =========================================================
+   CLOSE PEER
+========================================================= */
+
+function closePeerConnection() {
+
+  pendingIce = [];
+
+
+  if (
+    peerConnection
+  ) {
+
+    try {
+
+      peerConnection
+        .ontrack = null;
+
+      peerConnection
+        .onicecandidate = null;
+
+      peerConnection
+        .close();
+
+    } catch {}
+
+    peerConnection =
+      null;
+  }
+
+
+  remoteVideo.srcObject =
+    null;
+
+
+  if (
+    localStream
+  ) {
+
+    try {
+
+      for (
+        const track
+        of localStream.getTracks()
+      ) {
+
+        track.stop();
+      }
+
+    } catch {}
+
+
+    localStream =
+      null;
+  }
+
+
+  localVideo.srcObject =
+    null;
+
+
+  cameraEnabled =
+    true;
+
+  microphoneEnabled =
+    true;
+
+
+  updateMediaButtons();
+}
+
+
+/* =========================================================
+   CAMERA
+========================================================= */
+
+function toggleCamera() {
+
+  if (!localStream) {
+    return;
+  }
+
+
+  const tracks =
+    localStream
+      .getVideoTracks();
+
+
+  if (!tracks.length) {
+    return;
+  }
+
+
+  cameraEnabled =
+    !cameraEnabled;
+
+
+  for (
+    const track
+    of tracks
+  ) {
+
+    track.enabled =
+      cameraEnabled;
+  }
+
+
+  updateMediaButtons();
+}
+
+
+/* =========================================================
+   MICROPHONE
+========================================================= */
+
+function toggleMicrophone() {
+
+  if (!localStream) {
+    return;
+  }
+
+
+  const tracks =
+    localStream
+      .getAudioTracks();
+
+
+  if (!tracks.length) {
+    return;
+  }
+
+
+  microphoneEnabled =
+    !microphoneEnabled;
+
+
+  for (
+    const track
+    of tracks
+  ) {
+
+    track.enabled =
+      microphoneEnabled;
+  }
+
+
+  updateMediaButtons();
+}
+
+
+/* =========================================================
+   MEDIA BUTTONS
+========================================================= */
+
+function updateMediaButtons() {
+
+  const cameraBtn =
+    document.getElementById(
+      "cameraBtn"
+    );
+
+
+  const micBtn =
+    document.getElementById(
+      "micBtn"
+    );
+
+
+  if (
+    cameraEnabled
+  ) {
+
+    cameraBtn.textContent =
+      "📷 Camera On";
+
+    cameraBtn.classList
+      .remove("off");
+
+  } else {
+
+    cameraBtn.textContent =
+      "📷 Camera Off";
+
+    cameraBtn.classList
+      .add("off");
+  }
+
+
+  if (
+    microphoneEnabled
+  ) {
+
+    micBtn.textContent =
+      "🎤 Microphone On";
+
+    micBtn.classList
+      .remove("off");
+
+  } else {
+
+    micBtn.textContent =
+      "🔇 Microphone Off";
+
+    micBtn.classList
+      .add("off");
+  }
+}
+
+
+/* =========================================================
+   MESSAGE
+========================================================= */
+
+function clearMessages() {
+
+  messageList.innerHTML =
+    "";
+}
+
 
 function addMessage(
   text,
@@ -2088,53 +4117,60 @@ function addMessage(
       "div"
     );
 
+
   div.className =
-    "message" +
-    (mine ? " me" : "");
+    "overlay-message" +
+    (
+      mine
+        ? " mine"
+        : ""
+    );
 
 
-  div.innerHTML =
-    escapeHTML(text) +
-    "<small>" +
-    (mine
-      ? "You"
-      : "Stranger") +
-    "</small>";
+  div.textContent =
+    text;
 
 
-  $("messages")
-    .appendChild(div);
+  messageList.appendChild(
+    div
+  );
 
 
-  $("messages").scrollTop =
-    $("messages").scrollHeight;
+  messageList.scrollTop =
+    messageList.scrollHeight;
 }
 
 
-function sendMessage() {
-
-  const input =
-    $("chatInput");
+function sendChatMessage() {
 
   const text =
-    input.value.trim();
+    messageInput.value
+      .trim();
 
 
   if (
     !text ||
-    !partnerConnected ||
-    !ws ||
-    ws.readyState !== WebSocket.OPEN
+    !connected ||
+    !socket ||
+    socket.readyState !==
+      WebSocket.OPEN
   ) {
+
     return;
   }
 
 
-  ws.send(
+  socket.send(
+
     JSON.stringify({
-      type: "chat",
+
+      type:
+        "chat",
+
       text
+
     })
+
   );
 
 
@@ -2144,782 +4180,353 @@ function sendMessage() {
   );
 
 
-  input.value = "";
+  messageInput.value =
+    "";
 }
 
 
-/* =====================================================
-   WEBRTC
-===================================================== */
+/* =========================================================
+   REPORT
+========================================================= */
 
-const rtcConfig = {
+function openReport() {
 
-  iceServers: [
+  if (!connected) {
 
-    {
-      urls: [
-        "stun:stun.l.google.com:19302",
-        "stun:stun1.l.google.com:19302"
-      ]
-    }
-
-  ],
-
-  iceCandidatePoolSize: 10
-};
-
-
-async function createPeer() {
-
-  if (peer) {
-    return peer;
-  }
-
-
-  peer =
-    new RTCPeerConnection(
-      rtcConfig
-    );
-
-
-  peer.onicecandidate =
-    event => {
-
-      if (
-        event.candidate
-      ) {
-
-        sendSignal(
-          "candidate",
-          event.candidate
-        );
-      }
-    };
-
-
-  peer.ontrack =
-    event => {
-
-      const stream =
-        event.streams &&
-        event.streams[0];
-
-
-      if (stream) {
-
-        $("remoteVideo")
-          .srcObject = stream;
-
-
-        $("remoteVideo")
-          .play()
-          .catch(() => {});
-      }
-    };
-
-
-  peer.onconnectionstatechange =
-    () => {
-
-      if (!peer) {
-        return;
-      }
-
-
-      const state =
-        peer.connectionState;
-
-
-      if (state === "connected") {
-
-        setStatus(
-          "Video connected.",
-          "ok"
-        );
-      }
-
-
-      if (state === "connecting") {
-
-        setStatus(
-          "Connecting video...",
-          "wait"
-        );
-      }
-
-
-      if (
-        state === "disconnected"
-      ) {
-
-        setStatus(
-          "Video unstable. Reconnecting...",
-          "wait"
-        );
-
-        setTimeout(
-          restartICE,
-          700
-        );
-      }
-
-
-      if (state === "failed") {
-
-        setStatus(
-          "Video failed. Restarting...",
-          "wait"
-        );
-
-        setTimeout(
-          restartICE,
-          300
-        );
-      }
-    };
-
-
-  peer.oniceconnectionstatechange =
-    () => {
-
-      if (
-        peer &&
-        peer.iceConnectionState ===
-          "failed"
-      ) {
-
-        setTimeout(
-          restartICE,
-          300
-        );
-      }
-    };
-
-
-  if (localStream) {
-
-    for (
-      const track
-      of localStream.getTracks()
-    ) {
-
-      peer.addTrack(
-        track,
-        localStream
-      );
-    }
-  }
-
-
-  return peer;
-}
-
-
-/* =====================================================
-   MEDIA
-===================================================== */
-
-async function getMedia() {
-
-  if (localStream) {
-    return localStream;
-  }
-
-
-  localStream =
-    await navigator.mediaDevices
-      .getUserMedia({
-
-        video: {
-          facingMode: "user",
-
-          width: {
-            ideal: 1280
-          },
-
-          height: {
-            ideal: 720
-          }
-        },
-
-        audio: {
-          echoCancellation: true,
-
-          noiseSuppression: true,
-
-          autoGainControl: true
-        }
-      });
-
-
-  $("localVideo")
-    .srcObject = localStream;
-
-
-  $("localVideo")
-    .play()
-    .catch(() => {});
-
-
-  return localStream;
-}
-
-
-/* =====================================================
-   START VIDEO
-===================================================== */
-
-async function startVideo(
-  caller
-) {
-
-  try {
-
-    await getMedia();
-
-    await createPeer();
-
-
-    if (caller) {
-
-      const offer =
-        await peer.createOffer({
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: true
-        });
-
-
-      await peer.setLocalDescription(
-        offer
-      );
-
-
-      sendSignal(
-        "offer",
-        peer.localDescription
-      );
-    }
-
-  } catch (error) {
-
-    console.error(
-      error
-    );
-
-    setStatus(
-      "Camera/microphone permission is required.",
-      "wait"
-    );
-  }
-}
-
-
-/* =====================================================
-   OFFER
-===================================================== */
-
-async function handleOffer(
-  offer
-) {
-
-  await getMedia();
-
-  await createPeer();
-
-
-  await peer.setRemoteDescription(
-    new RTCSessionDescription(
-      offer
-    )
-  );
-
-
-  await flushICE();
-
-
-  const answer =
-    await peer.createAnswer();
-
-
-  await peer.setLocalDescription(
-    answer
-  );
-
-
-  sendSignal(
-    "answer",
-    peer.localDescription
-  );
-}
-
-
-/* =====================================================
-   ANSWER
-===================================================== */
-
-async function handleAnswer(
-  answer
-) {
-
-  if (!peer) {
-    return;
-  }
-
-
-  await peer.setRemoteDescription(
-    new RTCSessionDescription(
-      answer
-    )
-  );
-
-
-  await flushICE();
-}
-
-
-/* =====================================================
-   ICE
-===================================================== */
-
-async function handleCandidate(
-  candidate
-) {
-
-  if (
-    !peer ||
-    !peer.remoteDescription
-  ) {
-
-    iceQueue.push(
-      candidate
+    alert(
+      "You are not connected."
     );
 
     return;
   }
 
 
-  try {
-
-    await peer.addIceCandidate(
-      candidate
-    );
-
-  } catch (error) {
-
-    console.warn(
-      "ICE candidate error",
-      error
-    );
-  }
+  document
+    .getElementById(
+      "reportModal"
+    )
+    .classList
+    .add("show");
 }
 
 
-async function flushICE() {
+function closeReport() {
 
-  const queue =
-    iceQueue.splice(0);
-
-
-  for (
-    const candidate
-    of queue
-  ) {
-
-    try {
-
-      await peer.addIceCandidate(
-        candidate
-      );
-
-    } catch {}
-  }
+  document
+    .getElementById(
+      "reportModal"
+    )
+    .classList
+    .remove("show");
 }
 
 
-/* =====================================================
-   SEND SIGNAL
-===================================================== */
-
-function sendSignal(
-  type,
-  data
-) {
+function submitReport() {
 
   if (
-    !partnerConnected ||
-    !ws ||
-    ws.readyState !==
+    !connected ||
+    !socket ||
+    socket.readyState !==
       WebSocket.OPEN
   ) {
+
     return;
   }
 
 
-  ws.send(
+  const reason =
+    document.getElementById(
+      "reportReason"
+    ).value;
+
+
+  const details =
+    document.getElementById(
+      "reportDetails"
+    ).value;
+
+
+  socket.send(
+
     JSON.stringify({
-      type,
-      data
+
+      type:
+        "report",
+
+      reason,
+
+      details
+
     })
+
   );
+
+
+  closeReport();
 }
 
 
-/* =====================================================
-   ICE RESTART
-===================================================== */
+/* =========================================================
+   EVENTS
+========================================================= */
 
-async function restartICE() {
+startBtn.onclick =
+  startChat;
 
-  if (
-    !partnerConnected ||
-    mode !== "video"
-  ) {
-    return;
-  }
 
+nextBtn.onclick =
+  nextChat;
 
-  try {
 
-    await getMedia();
-
-    await createPeer();
-
-
-    if (role === "caller") {
-
-      const offer =
-        await peer.createOffer({
-          iceRestart: true
-        });
-
-
-      await peer.setLocalDescription(
-        offer
-      );
-
-
-      sendSignal(
-        "offer",
-        peer.localDescription
-      );
-    }
-
-  } catch (error) {
-
-    console.warn(
-      "ICE restart failed",
-      error
-    );
-  }
-}
-
-
-/* =====================================================
-   CLEANUP
-===================================================== */
-
-async function cleanupVideo() {
-
-  iceQueue = [];
-
-
-  if (peer) {
-
-    try {
-      peer.close();
-    } catch {}
-
-    peer = null;
-  }
-
-
-  if (localStream) {
-
-    for (
-      const track
-      of localStream.getTracks()
-    ) {
-
-      try {
-        track.stop();
-      } catch {}
-    }
-
-    localStream = null;
-  }
-
-
-  $("localVideo")
-    .srcObject = null;
-
-  $("remoteVideo")
-    .srcObject = null;
-}
-
-
-/* =====================================================
-   CAMERA
-===================================================== */
-
-$("camBtn").onclick =
-  () => {
-
-    if (!localStream) {
-      return;
-    }
-
-
-    const track =
-      localStream
-        .getVideoTracks()[0];
-
-
-    if (!track) {
-      return;
-    }
-
-
-    track.enabled =
-      !track.enabled;
-
-
-    $("camBtn").textContent =
-      track.enabled
-        ? "Camera"
-        : "Camera Off";
-  };
-
-
-/* =====================================================
-   MICROPHONE
-===================================================== */
-
-$("micBtn").onclick =
-  () => {
-
-    if (!localStream) {
-      return;
-    }
-
-
-    const track =
-      localStream
-        .getAudioTracks()[0];
-
-
-    if (!track) {
-      return;
-    }
-
-
-    track.enabled =
-      !track.enabled;
-
-
-    $("micBtn").textContent =
-      track.enabled
-        ? "Microphone"
-        : "Mic Off";
-  };
-
-
-/* =====================================================
-   VIDEO RECONNECT
-===================================================== */
-
-$("restartBtn").onclick =
-  restartICE;
-
-
-/* =====================================================
-   MODE
-===================================================== */
-
-$("textTab").onclick =
-  () => {
-
-    if (partnerConnected) {
-      return;
-    }
-
-
-    mode = "text";
-
-
-    $("textTab")
-      .classList
-      .add("active");
-
-
-    $("videoTab")
-      .classList
-      .remove("active");
-  };
-
-
-$("videoTab").onclick =
-  () => {
-
-    if (partnerConnected) {
-      return;
-    }
-
-
-    mode = "video";
-
-
-    $("videoTab")
-      .classList
-      .add("active");
-
-
-    $("textTab")
-      .classList
-      .remove("active");
-  };
-
-
-/* =====================================================
-   BUTTONS
-===================================================== */
-
-$("findBtn").onclick =
-  findPerson;
-
-
-$("nextBtn").onclick =
-  nextPerson;
-
-
-$("endBtn").onclick =
+endBtn.onclick =
   endChat;
 
 
-$("sendBtn").onclick =
-  sendMessage;
+reportBtn.onclick =
+  openReport;
 
 
-$("chatInput").onkeydown =
+document
+  .getElementById(
+    "cameraBtn"
+  )
+  .onclick =
+  toggleCamera;
+
+
+document
+  .getElementById(
+    "micBtn"
+  )
+  .onclick =
+  toggleMicrophone;
+
+
+document
+  .getElementById(
+    "reconnectBtn"
+  )
+  .onclick =
+  restartVideo;
+
+
+document
+  .getElementById(
+    "sendMessage"
+  )
+  .onclick =
+  sendChatMessage;
+
+
+messageInput.onkeydown =
   event => {
 
     if (
-      event.key === "Enter"
+      event.key ===
+      "Enter"
     ) {
 
-      sendMessage();
+      event.preventDefault();
+
+      sendChatMessage();
     }
   };
 
 
-/* =====================================================
-   PREFERENCES
-===================================================== */
+document
+  .getElementById(
+    "cancelReport"
+  )
+  .onclick =
+  closeReport;
 
-$("gender").onchange =
+
+document
+  .getElementById(
+    "submitReport"
+  )
+  .onclick =
+  submitReport;
+
+
+/* =========================================================
+   LOAD SAVED PREFERENCES
+========================================================= */
+
+window.addEventListener(
+  "load",
   () => {
 
-    if (
-      ws &&
-      ws.readyState ===
-        WebSocket.OPEN
-    ) {
-
-      ws.send(
-        JSON.stringify({
-          type: "prefs",
-          prefs: getPrefs()
-        })
-      );
-    }
-  };
-
-
-$("country").onchange =
-  () => {
-
-    if (
-      ws &&
-      ws.readyState ===
-        WebSocket.OPEN
-    ) {
-
-      ws.send(
-        JSON.stringify({
-          type: "prefs",
-          prefs: getPrefs()
-        })
-      );
-    }
-  };
-
-
-/* =====================================================
-   REPORT
-===================================================== */
-
-$("reportBtn").onclick =
-  () => {
-
-    if (!partnerConnected) {
-      return;
-    }
-
-
-    const reason =
-      prompt(
-        "Why are you reporting this person?"
+    const savedGender =
+      localStorage.getItem(
+        "randomtalk_my_gender"
       );
 
 
-    if (!reason?.trim()) {
-      return;
+    const savedPreferred =
+      localStorage.getItem(
+        "randomtalk_preferred_gender"
+      );
+
+
+    const savedCountry =
+      localStorage.getItem(
+        "randomtalk_country"
+      );
+
+
+    if (savedGender) {
+
+      document.getElementById(
+        "myGender"
+      ).value =
+        savedGender;
     }
 
 
-    ws.send(
-      JSON.stringify({
-        type: "report",
-        reason:
-          reason.trim()
-      })
-    );
-  };
+    if (savedPreferred) {
+
+      document.getElementById(
+        "preferredGender"
+      ).value =
+        savedPreferred;
+    }
 
 
-/* =====================================================
+    if (savedCountry) {
+
+      document.getElementById(
+        "country"
+      ).value =
+        savedCountry;
+    }
+
+
+    updateButtons();
+
+    updateMediaButtons();
+  }
+);
+
+
+/* =========================================================
+   SAVE PREFERENCES
+========================================================= */
+
+document
+  .getElementById(
+    "myGender"
+  )
+  .onchange =
+  savePreferences;
+
+
+document
+  .getElementById(
+    "preferredGender"
+  )
+  .onchange =
+  savePreferences;
+
+
+document
+  .getElementById(
+    "country"
+  )
+  .onchange =
+  savePreferences;
+
+
+function savePreferences() {
+
+  localStorage.setItem(
+
+    "randomtalk_my_gender",
+
+    document
+      .getElementById(
+        "myGender"
+      )
+      .value
+
+  );
+
+
+  localStorage.setItem(
+
+    "randomtalk_preferred_gender",
+
+    document
+      .getElementById(
+        "preferredGender"
+      )
+      .value
+
+  );
+
+
+  localStorage.setItem(
+
+    "randomtalk_country",
+
+    document
+      .getElementById(
+        "country"
+      )
+      .value
+
+  );
+}
+
+
+/* =========================================================
    PAGE CLOSE
-===================================================== */
+========================================================= */
 
 window.addEventListener(
   "beforeunload",
   () => {
 
-    manualClose = true;
+    manualClose =
+      true;
+
 
     try {
-      ws?.close();
+
+      if (
+        socket &&
+        socket.readyState ===
+          WebSocket.OPEN
+      ) {
+
+        socket.send(
+          JSON.stringify({
+            type: "end"
+          })
+        );
+
+        socket.close();
+      }
+
     } catch {}
 
+
     try {
-      localStream
-        ?.getTracks()
-        .forEach(
-          track => track.stop()
-        );
+
+      closePeerConnection();
+
     } catch {}
   }
 );
 
 
-/* =====================================================
-   START
-===================================================== */
+/* =========================================================
+   INITIAL
+========================================================= */
 
-setButtons(false);
+updateButtons();
 
-connect();
-
-})();
+updateMediaButtons();
 
 </script>
 
