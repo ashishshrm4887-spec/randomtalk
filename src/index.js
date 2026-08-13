@@ -1,98 +1,154 @@
 import { DurableObject } from "cloudflare:workers";
 
-/*
-========================================================
- RANDOMTALK
- Text Chat + Video Chat + WebRTC + Report System
- Cloudflare Worker + Durable Object
-========================================================
-*/
+/* =========================================================
+   RANDOMTALK - CHAT ROOM
+   Text chat + Video chat + Report system
+========================================================= */
 
 export class ChatRoom extends DurableObject {
 
   constructor(ctx, env) {
     super(ctx, env);
-
-    this.ctx = ctx;
-    this.env = env;
-
-    this.waiting = {
-      text: null,
-      video: null
-    };
-
-    this.partners = new Map();
-    this.modes = new Map();
-    this.sessions = new Map();
-
-    /*
-      Make sure report storage exists.
-      Reports are stored in Durable Object storage.
-    */
   }
+
+  /* ---------------------------------------------------------
+     HELPERS
+  --------------------------------------------------------- */
+
+  send(ws, data) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify(data));
+      } catch (error) {
+        console.error("WebSocket send error:", error);
+      }
+    }
+  }
+
+  getInfo(ws) {
+    try {
+      return ws.deserializeAttachment() || {};
+    } catch {
+      return {};
+    }
+  }
+
+  setInfo(ws, info) {
+    ws.serializeAttachment(info);
+  }
+
+  getSockets() {
+    return this.ctx.getWebSockets();
+  }
+
+  findSocketById(id) {
+    if (!id) return null;
+
+    for (const ws of this.getSockets()) {
+      const info = this.getInfo(ws);
+
+      if (info.id === id) {
+        return ws;
+      }
+    }
+
+    return null;
+  }
+
+  findWaitingUser(mode, currentSocket) {
+
+    for (const ws of this.getSockets()) {
+
+      if (ws === currentSocket) {
+        continue;
+      }
+
+      if (ws.readyState !== WebSocket.OPEN) {
+        continue;
+      }
+
+      const info = this.getInfo(ws);
+
+      if (
+        info.mode === mode &&
+        info.status === "waiting"
+      ) {
+        return ws;
+      }
+    }
+
+    return null;
+  }
+
+  /* ---------------------------------------------------------
+     WEBSOCKET CONNECTION
+  --------------------------------------------------------- */
 
   async fetch(request) {
 
     if (
-      request.method === "GET" &&
-      request.headers.get("Upgrade") === "websocket"
+      request.headers.get("Upgrade")?.toLowerCase() !==
+      "websocket"
     ) {
-
-      const pair = new WebSocketPair();
-
-      const client = pair[0];
-      const server = pair[1];
-
-      /*
-        Current Cloudflare Durable Object
-        WebSocket Hibernation API.
-      */
-      this.ctx.acceptWebSocket(server);
-
-      const sessionId = crypto.randomUUID();
-
-      this.sessions.set(server, {
-        id: sessionId,
-        mode: null
-      });
-
-      return new Response(null, {
-        status: 101,
-        webSocket: client
-      });
+      return new Response(
+        "RandomTalk ChatRoom is running.",
+        { status: 200 }
+      );
     }
 
-    return new Response("ChatRoom is running.", {
-      status: 200
+    const pair = new WebSocketPair();
+
+    const client = pair[0];
+    const server = pair[1];
+
+    /*
+      IMPORTANT:
+      Use the Durable Object hibernation WebSocket API.
+    */
+
+    this.ctx.acceptWebSocket(server);
+
+    const id = crypto.randomUUID();
+
+    this.setInfo(server, {
+      id,
+      mode: "text",
+      status: "idle",
+      partnerId: null,
+      joinedAt: Date.now()
+    });
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client
     });
   }
 
-  send(socket, data) {
+  /* ---------------------------------------------------------
+     MESSAGE HANDLER
 
-    if (
-      socket &&
-      socket.readyState === WebSocket.OPEN
-    ) {
-      try {
-        socket.send(JSON.stringify(data));
-      } catch {}
-    }
-  }
+     IMPORTANT:
+     This is ASYNC.
+     Therefore await this.saveReport(...) is valid.
+  --------------------------------------------------------- */
 
-  webSocketMessage(socket, message) {
+  async webSocketMessage(ws, message) {
 
     let data;
 
     try {
 
-      data =
-        typeof message === "string"
-          ? JSON.parse(message)
-          : JSON.parse(new TextDecoder().decode(message));
+      if (typeof message === "string") {
+        data = JSON.parse(message);
+      } else {
+        data = JSON.parse(
+          new TextDecoder().decode(message)
+        );
+      }
 
-    } catch {
+    } catch (error) {
 
-      this.send(socket, {
+      this.send(ws, {
         type: "error",
         message: "Invalid message."
       });
@@ -100,11 +156,13 @@ export class ChatRoom extends DurableObject {
       return;
     }
 
-    /*
-    ======================================================
-      JOIN
-    ======================================================
-    */
+    if (!data || !data.type) {
+      return;
+    }
+
+    /* =======================================================
+       JOIN
+    ======================================================= */
 
     if (data.type === "join") {
 
@@ -113,33 +171,44 @@ export class ChatRoom extends DurableObject {
           ? "video"
           : "text";
 
-      this.removeFromWaiting(socket);
-      this.removePartnerOnly(socket);
+      const oldInfo = this.getInfo(ws);
 
-      this.modes.set(socket, mode);
+      const info = {
+        ...oldInfo,
+        mode,
+        status: "waiting",
+        partnerId: null
+      };
 
-      const session =
-        this.sessions.get(socket);
-
-      if (session) {
-        session.mode = mode;
-      }
+      this.setInfo(ws, info);
 
       const other =
-        this.waiting[mode];
+        this.findWaitingUser(
+          mode,
+          ws
+        );
 
-      if (
-        other &&
-        other !== socket &&
-        other.readyState === WebSocket.OPEN
-      ) {
+      if (other) {
 
-        this.waiting[mode] = null;
+        const otherInfo =
+          this.getInfo(other);
 
-        this.partners.set(socket, other);
-        this.partners.set(other, socket);
+        const thisId = info.id;
+        const otherId = otherInfo.id;
 
-        this.send(socket, {
+        this.setInfo(ws, {
+          ...info,
+          status: "matched",
+          partnerId: otherId
+        });
+
+        this.setInfo(other, {
+          ...otherInfo,
+          status: "matched",
+          partnerId: thisId
+        });
+
+        this.send(ws, {
           type: "matched",
           mode,
           initiator: false
@@ -153,435 +222,364 @@ export class ChatRoom extends DurableObject {
 
       } else {
 
-        this.waiting[mode] = socket;
-
-        this.send(socket, {
+        this.send(ws, {
           type: "waiting",
           mode
         });
+
       }
 
       return;
     }
 
-    /*
-    ======================================================
-      CHAT
-    ======================================================
-    */
+    /* =======================================================
+       CHAT MESSAGE
+    ======================================================= */
 
     if (data.type === "chat") {
 
-      const partner =
-        this.partners.get(socket);
+      const info = this.getInfo(ws);
 
       if (
-        partner &&
-        partner.readyState === WebSocket.OPEN
+        !info.partnerId ||
+        info.status !== "matched"
       ) {
-
-        const text =
-          String(data.text || "")
-            .trim()
-            .slice(0, 2000);
-
-        if (!text) return;
-
-        this.send(partner, {
-          type: "chat",
-          text
-        });
+        return;
       }
+
+      const partner =
+        this.findSocketById(
+          info.partnerId
+        );
+
+      if (!partner) {
+        return;
+      }
+
+      const text =
+        String(data.text || "")
+          .trim()
+          .slice(0, 2000);
+
+      if (!text) {
+        return;
+      }
+
+      this.send(partner, {
+        type: "chat",
+        text
+      });
 
       return;
     }
 
-    /*
-    ======================================================
-      WEBRTC SIGNAL
-    ======================================================
-    */
+    /* =======================================================
+       WEBRTC SIGNAL
+    ======================================================= */
 
     if (data.type === "signal") {
 
-      const partner =
-        this.partners.get(socket);
+      const info = this.getInfo(ws);
 
-      if (
-        partner &&
-        partner.readyState === WebSocket.OPEN
-      ) {
-
-        this.send(partner, {
-          type: "signal",
-          signal: data.signal
-        });
+      if (!info.partnerId) {
+        return;
       }
+
+      const partner =
+        this.findSocketById(
+          info.partnerId
+        );
+
+      if (!partner) {
+        return;
+      }
+
+      this.send(partner, {
+        type: "signal",
+        signal: data.signal
+      });
 
       return;
     }
 
-    /*
-    ======================================================
-      NEXT
-    ======================================================
-    */
+    /* =======================================================
+       NEXT
+    ======================================================= */
 
     if (data.type === "next") {
 
-      const mode =
-        this.modes.get(socket) || "text";
+      const info = this.getInfo(ws);
 
       const partner =
-        this.partners.get(socket);
+        info.partnerId
+          ? this.findSocketById(info.partnerId)
+          : null;
 
       if (partner) {
 
-        this.partners.delete(socket);
-        this.partners.delete(partner);
+        const partnerInfo =
+          this.getInfo(partner);
+
+        this.setInfo(partner, {
+          ...partnerInfo,
+          status: "waiting",
+          partnerId: null
+        });
 
         this.send(partner, {
           type: "partner_left"
         });
-      }
-
-      this.waitForUser(socket, mode);
-
-      return;
-    }
-
-    /*
-    ======================================================
-      END
-    ======================================================
-    */
-
-    if (data.type === "end") {
-
-      this.endUser(socket);
-
-      return;
-    }
-
-    /*
-    ======================================================
-      REPORT
-    ======================================================
-    */
-
-    if (data.type === "report") {
-
-      await this.saveReport(socket, data);
-
-      return;
-    }
-  }
-
-  webSocketClose(socket) {
-
-    this.cleanup(socket);
-  }
-
-  webSocketError(socket) {
-
-    this.cleanup(socket);
-  }
-
-  /*
-  ========================================================
-    WAIT FOR USER
-  ========================================================
-  */
-
-  waitForUser(socket, mode) {
-
-    if (
-      !socket ||
-      socket.readyState !== WebSocket.OPEN
-    ) {
-      return;
-    }
-
-    mode =
-      mode === "video"
-        ? "video"
-        : "text";
-
-    this.removeFromWaiting(socket);
-    this.removePartnerOnly(socket);
-
-    this.modes.set(socket, mode);
-
-    const session =
-      this.sessions.get(socket);
-
-    if (session) {
-      session.mode = mode;
-    }
-
-    const other =
-      this.waiting[mode];
-
-    if (
-      other &&
-      other !== socket &&
-      other.readyState === WebSocket.OPEN
-    ) {
-
-      this.waiting[mode] = null;
-
-      this.partners.set(socket, other);
-      this.partners.set(other, socket);
-
-      this.send(socket, {
-        type: "matched",
-        mode,
-        initiator: false
-      });
-
-      this.send(other, {
-        type: "matched",
-        mode,
-        initiator: true
-      });
-
-      return;
-    }
-
-    this.waiting[mode] = socket;
-
-    this.send(socket, {
-      type: "waiting",
-      mode
-    });
-  }
-
-  /*
-  ========================================================
-    END USER
-  ========================================================
-  */
-
-  endUser(socket) {
-
-    this.removeFromWaiting(socket);
-
-    const partner =
-      this.partners.get(socket);
-
-    if (partner) {
-
-      this.partners.delete(socket);
-      this.partners.delete(partner);
-
-      this.send(partner, {
-        type: "partner_left"
-      });
-
-      const partnerMode =
-        this.modes.get(partner) || "text";
-
-      /*
-        Keep the partner searching.
-      */
-      if (
-        partner.readyState === WebSocket.OPEN
-      ) {
-
-        this.waitForUser(
-          partner,
-          partnerMode
-        );
-      }
-    }
-
-    this.modes.delete(socket);
-    this.sessions.delete(socket);
-  }
-
-  /*
-  ========================================================
-    REMOVE PARTNER ONLY
-  ========================================================
-  */
-
-  removePartnerOnly(socket) {
-
-    const partner =
-      this.partners.get(socket);
-
-    if (!partner) {
-      return;
-    }
-
-    this.partners.delete(socket);
-    this.partners.delete(partner);
-
-    if (
-      partner.readyState === WebSocket.OPEN
-    ) {
-
-      this.send(partner, {
-        type: "partner_left"
-      });
-    }
-  }
-
-  /*
-  ========================================================
-    WAITING CLEANUP
-  ========================================================
-  */
-
-  removeFromWaiting(socket) {
-
-    if (this.waiting.text === socket) {
-      this.waiting.text = null;
-    }
-
-    if (this.waiting.video === socket) {
-      this.waiting.video = null;
-    }
-  }
-
-  /*
-  ========================================================
-    CONNECTION CLEANUP
-  ========================================================
-  */
-
-  cleanup(socket) {
-
-    this.removeFromWaiting(socket);
-
-    const partner =
-      this.partners.get(socket);
-
-    if (partner) {
-
-      this.partners.delete(socket);
-      this.partners.delete(partner);
-
-      if (
-        partner.readyState === WebSocket.OPEN
-      ) {
-
-        this.send(partner, {
-          type: "partner_left"
-        });
-
-        const mode =
-          this.modes.get(partner) || "text";
-
-        this.waiting[mode] = partner;
 
         this.send(partner, {
           type: "waiting",
-          mode
+          mode: partnerInfo.mode || "text"
         });
       }
-    }
 
-    this.partners.delete(socket);
-    this.modes.delete(socket);
-    this.sessions.delete(socket);
-  }
-
-  /*
-  ========================================================
-    REPORT STORAGE
-  ========================================================
-  */
-
-  async saveReport(socket, data) {
-
-    const session =
-      this.sessions.get(socket);
-
-    const reporterId =
-      session?.id ||
-      crypto.randomUUID();
-
-    const reasons = {
-      nudity: "Nudity / sexual content",
-      harassment: "Harassment / bullying",
-      threats: "Threats / violence",
-      spam: "Spam / scam",
-      underage: "Underage concern",
-      other: "Other"
-    };
-
-    const reason =
-      reasons[data.reason]
-        ? data.reason
-        : "other";
-
-    const reportId =
-      crypto.randomUUID();
-
-    const report = {
-      id: reportId,
-      reporterId,
-      reason,
-      description:
-        String(data.description || "")
-          .slice(0, 1000),
-      createdAt:
-        new Date().toISOString()
-    };
-
-    try {
-
-      await this.ctx.storage.put(
-        `report:${reportId}`,
-        report
-      );
-
-      /*
-        Keep a simple counter.
-      */
-
-      const oldCount =
-        await this.ctx.storage.get(
-          "report_count"
-        );
-
-      const count =
-        Number(oldCount || 0) + 1;
-
-      await this.ctx.storage.put(
-        "report_count",
-        count
-      );
-
-      this.send(socket, {
-        type: "report_success",
-        message:
-          "Report submitted successfully."
+      this.setInfo(ws, {
+        ...info,
+        status: "waiting",
+        partnerId: null
       });
 
-    } catch (error) {
+      this.send(ws, {
+        type: "waiting",
+        mode: info.mode || "text"
+      });
 
-      console.error(
-        "Report storage error:",
-        error
+      return;
+    }
+
+    /* =======================================================
+       END CHAT
+    ======================================================= */
+
+    if (data.type === "end") {
+
+      const info = this.getInfo(ws);
+
+      const partner =
+        info.partnerId
+          ? this.findSocketById(info.partnerId)
+          : null;
+
+      if (partner) {
+
+        const partnerInfo =
+          this.getInfo(partner);
+
+        this.setInfo(partner, {
+          ...partnerInfo,
+          status: "idle",
+          partnerId: null
+        });
+
+        this.send(partner, {
+          type: "partner_left"
+        });
+      }
+
+      this.setInfo(ws, {
+        ...info,
+        status: "idle",
+        partnerId: null
+      });
+
+      return;
+    }
+
+    /* =======================================================
+       REPORT
+    ======================================================= */
+
+    if (data.type === "report") {
+
+      const info = this.getInfo(ws);
+
+      const reason =
+        String(data.reason || "Other")
+          .slice(0, 100);
+
+      const details =
+        String(data.details || "")
+          .slice(0, 500);
+
+      const report = {
+        id: crypto.randomUUID(),
+
+        createdAt:
+          new Date().toISOString(),
+
+        reason,
+        details,
+
+        reporterId:
+          info.id || "unknown",
+
+        reportedUserId:
+          info.partnerId || "unknown",
+
+        mode:
+          info.mode || "text"
+      };
+
+      /*
+        THIS IS ASYNC.
+        The old code had await here in a non-async function.
+        That caused your build error.
+      */
+
+      await this.saveReport(report);
+
+      this.send(ws, {
+        type: "report_success",
+        message:
+          "Report submitted successfully. Thank you."
+      });
+
+      return;
+    }
+
+    /* =======================================================
+       PING
+    ======================================================= */
+
+    if (data.type === "ping") {
+
+      this.send(ws, {
+        type: "pong"
+      });
+
+      return;
+    }
+  }
+
+  /* ---------------------------------------------------------
+     SAVE REPORT
+  --------------------------------------------------------- */
+
+  async saveReport(report) {
+
+    const key =
+      "report:" + report.id;
+
+    await this.ctx.storage.put(
+      key,
+      report
+    );
+
+    /*
+      Keep a simple report counter.
+    */
+
+    const oldCount =
+      await this.ctx.storage.get(
+        "report_count"
       );
 
-      this.send(socket, {
-        type: "report_error",
-        message:
-          "Could not save the report."
+    const count =
+      Number(oldCount || 0) + 1;
+
+    await this.ctx.storage.put(
+      "report_count",
+      count
+    );
+
+    console.log(
+      "Report saved:",
+      report.id
+    );
+  }
+
+  /* ---------------------------------------------------------
+     CLOSE
+  --------------------------------------------------------- */
+
+  async webSocketClose(
+    ws,
+    code,
+    reason,
+    wasClean
+  ) {
+
+    const info =
+      this.getInfo(ws);
+
+    const partner =
+      info.partnerId
+        ? this.findSocketById(info.partnerId)
+        : null;
+
+    if (partner) {
+
+      const partnerInfo =
+        this.getInfo(partner);
+
+      this.setInfo(partner, {
+        ...partnerInfo,
+        status: "waiting",
+        partnerId: null
+      });
+
+      this.send(partner, {
+        type: "partner_left"
+      });
+
+      this.send(partner, {
+        type: "waiting",
+        mode:
+          partnerInfo.mode || "text"
+      });
+    }
+  }
+
+  /* ---------------------------------------------------------
+     ERROR
+  --------------------------------------------------------- */
+
+  async webSocketError(ws, error) {
+
+    console.error(
+      "WebSocket error:",
+      error
+    );
+
+    const info =
+      this.getInfo(ws);
+
+    const partner =
+      info.partnerId
+        ? this.findSocketById(info.partnerId)
+        : null;
+
+    if (partner) {
+
+      const partnerInfo =
+        this.getInfo(partner);
+
+      this.setInfo(partner, {
+        ...partnerInfo,
+        status: "waiting",
+        partnerId: null
+      });
+
+      this.send(partner, {
+        type: "partner_left"
+      });
+
+      this.send(partner, {
+        type: "waiting",
+        mode:
+          partnerInfo.mode || "text"
       });
     }
   }
 }
 
 
-/*
-========================================================
- MAIN WORKER
-========================================================
-*/
+/* =========================================================
+   MAIN WORKER
+========================================================= */
 
 export default {
 
@@ -590,26 +588,19 @@ export default {
     const url =
       new URL(request.url);
 
-    /*
-    ======================================================
-      WEBSOCKET
-    ======================================================
-    */
+    /* -------------------------------------------------------
+       WEBSOCKET
+    ------------------------------------------------------- */
 
-    if (
-      url.pathname === "/ws"
-    ) {
+    if (url.pathname === "/ws") {
 
       if (
         request.headers.get("Upgrade")
           ?.toLowerCase() !== "websocket"
       ) {
-
         return new Response(
-          "WebSocket connection required.",
-          {
-            status: 426
-          }
+          "WebSocket upgrade required.",
+          { status: 426 }
         );
       }
 
@@ -624,14 +615,33 @@ export default {
       return room.fetch(request);
     }
 
-    /*
-    ======================================================
-      WEBSITE
-    ======================================================
-    */
+    /* -------------------------------------------------------
+       HEALTH CHECK
+    ------------------------------------------------------- */
+
+    if (url.pathname === "/health") {
+
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          service: "RandomTalk",
+          time: new Date().toISOString()
+        }),
+        {
+          headers: {
+            "content-type":
+              "application/json"
+          }
+        }
+      );
+    }
+
+    /* -------------------------------------------------------
+       WEBSITE
+    ------------------------------------------------------- */
 
     return new Response(
-      HTML,
+      HTML_PAGE,
       {
         headers: {
           "content-type":
@@ -643,13 +653,11 @@ export default {
 };
 
 
-/*
-========================================================
- HTML
-========================================================
-*/
+/* =========================================================
+   HTML
+========================================================= */
 
-const HTML = `<!DOCTYPE html>
+const HTML_PAGE = `<!DOCTYPE html>
 
 <html lang="en">
 
@@ -667,19 +675,20 @@ const HTML = `<!DOCTYPE html>
 <style>
 
 * {
-  box-sizing:border-box;
+  box-sizing: border-box;
 }
 
 html {
-  scroll-behavior:smooth;
+  scroll-behavior: smooth;
 }
 
 body {
-  margin:0;
+  margin: 0;
+
   background:
     radial-gradient(
       circle at 80% 20%,
-      rgba(124,58,237,.18),
+      rgba(124,58,237,.20),
       transparent 30%
     ),
     radial-gradient(
@@ -689,7 +698,7 @@ body {
     ),
     #050816;
 
-  color:#f8fafc;
+  color: #f8fafc;
 
   font-family:
     Inter,
@@ -701,108 +710,101 @@ body {
 
 button,
 input,
+select,
 textarea {
-  font:inherit;
+  font: inherit;
 }
 
 button {
-  cursor:pointer;
+  cursor: pointer;
 }
 
 .container {
-  width:min(
-    1100px,
-    calc(100% - 28px)
-  );
+  width:
+    min(
+      1180px,
+      calc(100% - 32px)
+    );
 
-  margin:auto;
+  margin: auto;
 }
 
 /* NAV */
 
 .navbar {
-  height:70px;
+  height: 75px;
 
   border-bottom:
-    1px solid #1c263b;
+    1px solid rgba(
+      148,
+      163,
+      184,
+      .12
+    );
 
-  display:flex;
-  align-items:center;
+  display: flex;
+  align-items: center;
 }
 
 .nav-inner {
-  width:min(
-    1100px,
-    calc(100% - 28px)
-  );
+  width:
+    min(
+      1180px,
+      calc(100% - 32px)
+    );
 
-  margin:auto;
+  margin: auto;
 
-  display:flex;
-  justify-content:space-between;
-  align-items:center;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 
 .logo {
-  font-size:23px;
-  font-weight:800;
-
-  display:flex;
-  align-items:center;
-  gap:9px;
-}
-
-.logo-icon {
-  width:38px;
-  height:38px;
-
-  border-radius:12px;
-
-  display:grid;
-  place-items:center;
-
-  background:
-    linear-gradient(
-      135deg,
-      #a855f7,
-      #6366f1
-    );
+  font-size: 24px;
+  font-weight: 900;
 }
 
 .logo span {
-  background:
-    linear-gradient(
-      90deg,
-      #d946ef,
-      #6366f1
-    );
-
-  -webkit-background-clip:text;
-  color:transparent;
+  color: #a855f7;
 }
 
-/* HERO */
+.nav-links {
+  display: flex;
+  gap: 30px;
+}
+
+.nav-links a {
+  color: #dbe3f1;
+  text-decoration: none;
+}
 
 .hero {
-  padding:
-    55px
-    0
-    40px;
+  padding: 70px 0;
 
-  text-align:center;
+  display: grid;
+
+  grid-template-columns:
+    1fr 1fr;
+
+  gap: 50px;
+
+  align-items: center;
 }
 
 .hero h1 {
+  margin: 0;
+
   font-size:
     clamp(
       45px,
-      8vw,
-      75px
+      6vw,
+      76px
     );
 
-  line-height:1;
+  line-height: 1;
 
-  margin:0;
+  letter-spacing: -3px;
 }
 
 .gradient {
@@ -814,32 +816,42 @@ button {
       #6366f1
     );
 
-  -webkit-background-clip:text;
-  color:transparent;
+  -webkit-background-clip: text;
+
+  color: transparent;
 }
 
 .hero p {
-  max-width:600px;
-  margin:22px auto;
+  color: #aab5ca;
 
-  color:#aab5ca;
+  font-size: 20px;
 
-  font-size:18px;
-  line-height:1.6;
+  line-height: 1.6;
+
+  max-width: 570px;
+}
+
+.hero-buttons {
+  display: flex;
+
+  gap: 12px;
+
+  flex-wrap: wrap;
+}
+
+.primary,
+.secondary {
+  padding: 15px 22px;
+
+  border-radius: 13px;
+
+  font-weight: 800;
 }
 
 .primary {
-  border:0;
+  border: 0;
 
-  padding:
-    16px
-    25px;
-
-  border-radius:14px;
-
-  color:white;
-
-  font-weight:800;
+  color: white;
 
   background:
     linear-gradient(
@@ -849,59 +861,62 @@ button {
     );
 }
 
+.secondary {
+  border:
+    1px solid #34415d;
+
+  color: white;
+
+  background: transparent;
+}
+
 /* APP */
 
 .chat-app {
-
-  margin-bottom:50px;
+  margin-bottom: 70px;
 
   border:
     1px solid #25304a;
 
-  background:#080f20;
+  background: #080f20;
 
-  border-radius:22px;
+  border-radius: 22px;
 
-  overflow:hidden;
+  overflow: hidden;
 }
 
-/* TABS */
-
 .tabs {
+  display: flex;
 
-  display:flex;
-  gap:10px;
+  gap: 10px;
 
-  padding:14px;
+  padding: 16px;
 
   border-bottom:
     1px solid #202b42;
 }
 
 .tab {
+  flex: 1;
 
-  flex:1;
+  padding: 14px;
 
-  padding:15px;
-
-  border-radius:13px;
+  border-radius: 12px;
 
   border:
-    1px solid #293651;
+    1px solid #26324b;
 
-  background:
-    #0b1222;
+  background: transparent;
 
-  color:#aeb9ce;
+  color: #aeb9ce;
 
-  font-weight:800;
+  font-weight: 800;
 }
 
 .tab.active {
+  color: white;
 
-  color:white;
-
-  border-color:transparent;
+  border-color: transparent;
 
   background:
     linear-gradient(
@@ -911,246 +926,261 @@ button {
     );
 }
 
-/* HEADER */
+.layout {
+  display: grid;
 
-.status {
+  grid-template-columns:
+    260px 1fr;
+}
 
-  padding:
-    18px
-    20px;
+.sidebar {
+  padding: 20px;
+
+  border-right:
+    1px solid #202b42;
+}
+
+.preference {
+  margin: 20px 0;
+}
+
+.preference-title {
+  color: #aab5ca;
+
+  margin-bottom: 9px;
+}
+
+.preference-buttons {
+  display: flex;
+}
+
+.preference-buttons button {
+  flex: 1;
+
+  padding: 10px;
+
+  border:
+    1px solid #27334d;
+
+  background: #111a2d;
+
+  color: white;
+}
+
+.preference-buttons button.selected {
+  background: #7c3aed;
+}
+
+.select-box {
+  width: 100%;
+
+  padding: 12px;
+
+  border-radius: 10px;
+
+  border:
+    1px solid #27334d;
+
+  background: #111a2d;
+
+  color: white;
+}
+
+.save-btn {
+  width: 100%;
+
+  padding: 12px;
+
+  border: 0;
+
+  border-radius: 10px;
+
+  color: white;
+
+  font-weight: 800;
+
+  background:
+    linear-gradient(
+      90deg,
+      #c026d3,
+      #7c3aed
+    );
+}
+
+.chat-panel {
+  min-height: 620px;
+
+  display: flex;
+
+  flex-direction: column;
+}
+
+.chat-header {
+  padding: 20px;
+
+  display: flex;
+
+  justify-content: space-between;
 
   border-bottom:
     1px solid #202b42;
-
-  display:flex;
-
-  justify-content:space-between;
-
-  align-items:center;
 }
 
-.status-title {
-  font-weight:800;
+.status {
+  color: #fbbf24;
+
+  font-weight: 800;
 }
 
-.status-title.waiting {
-  color:#fbbf24;
-}
-
-.status-title.connected {
-  color:#4ade80;
-}
-
-.status-text {
-  margin-top:5px;
-  color:#94a3b8;
+.status.connected {
+  color: #4ade80;
 }
 
 .report-btn {
-
-  padding:
-    10px
-    16px;
-
-  border-radius:20px;
-
-  background:transparent;
-
   border:
-    1px solid #7f3042;
+    1px solid #6b2737;
 
-  color:#fb7185;
+  background: transparent;
 
-  font-weight:700;
-}
+  color: #fb7185;
 
-/* CONTENT */
+  padding: 9px 14px;
 
-.content {
-  padding:20px;
+  border-radius: 20px;
 }
 
 /* VIDEO */
 
 .video-area {
-  display:none;
+  display: none;
+
+  padding: 18px;
 }
 
 .video-area.show {
-  display:block;
+  display: block;
 }
 
 .video-box {
+  position: relative;
 
-  position:relative;
+  height: 480px;
 
-  width:100%;
+  overflow: hidden;
 
-  height:
-    min(
-      500px,
-      65vh
-    );
+  border-radius: 18px;
 
-  min-height:330px;
-
-  border-radius:18px;
-
-  overflow:hidden;
-
-  background:#020617;
+  background: #020617;
 
   border:
     1px solid #27334d;
 }
 
 #remoteVideo {
+  width: 100%;
+  height: 100%;
 
-  width:100%;
-  height:100%;
-
-  object-fit:cover;
-
-  background:#020617;
+  object-fit: cover;
 }
 
 #localVideo {
+  position: absolute;
 
-  position:absolute;
+  right: 15px;
+  bottom: 15px;
 
-  right:14px;
-  bottom:14px;
+  width: 150px;
+  height: 115px;
 
-  width:130px;
-  height:175px;
+  object-fit: cover;
 
-  object-fit:cover;
-
-  border-radius:15px;
+  border-radius: 14px;
 
   border:
     2px solid #7c3aed;
 
-  background:#020617;
-
-  z-index:5;
+  background: #020617;
 }
 
 .video-placeholder {
+  position: absolute;
 
-  position:absolute;
+  inset: 0;
 
-  inset:0;
+  display: grid;
 
-  display:grid;
+  place-items: center;
 
-  place-items:center;
+  text-align: center;
 
-  text-align:center;
+  color: #94a3b8;
 
-  color:#94a3b8;
-
-  z-index:2;
+  font-size: 18px;
 }
 
-.video-placeholder-icon {
-  font-size:55px;
-  margin-bottom:10px;
+.video-controls {
+  display: none;
+
+  gap: 10px;
+
+  padding: 12px 18px;
 }
 
-.video-label {
-
-  position:absolute;
-
-  left:14px;
-  bottom:14px;
-
-  padding:
-    8px
-    13px;
-
-  border-radius:18px;
-
-  background:#000b;
-
-  z-index:7;
-}
-
-/* CONTROLS */
-
-.controls {
-
-  display:none;
-
-  gap:10px;
-
-  margin-top:12px;
-}
-
-.controls.show {
-  display:flex;
+.video-controls.show {
+  display: flex;
 }
 
 .control {
+  flex: 1;
 
-  flex:1;
+  padding: 12px;
 
-  padding:13px;
-
-  border-radius:12px;
-
-  background:#111a2d;
+  border-radius: 10px;
 
   border:
     1px solid #27334d;
 
-  color:white;
+  background: #111a2d;
 
-  font-weight:700;
+  color: white;
 }
 
-/* TEXT */
+/* MESSAGES */
 
 .messages {
+  flex: 1;
 
-  min-height:300px;
+  padding: 22px;
 
-  max-height:420px;
+  display: flex;
 
-  overflow-y:auto;
+  flex-direction: column;
 
-  padding:10px 0;
+  gap: 12px;
 
-  display:flex;
+  overflow-y: auto;
 
-  flex-direction:column;
-
-  gap:12px;
+  max-height: 400px;
 }
 
 .message {
+  max-width: 75%;
 
-  max-width:80%;
+  padding: 12px 16px;
 
-  padding:
-    12px
-    15px;
+  border-radius: 16px;
 
-  border-radius:16px;
-
-  line-height:1.4;
+  line-height: 1.45;
 }
 
 .received {
+  align-self: flex-start;
 
-  align-self:flex-start;
-
-  background:#182238;
+  background: #182238;
 }
 
 .sent {
-
-  align-self:flex-end;
+  align-self: flex-end;
 
   background:
     linear-gradient(
@@ -1160,49 +1190,42 @@ button {
     );
 }
 
-/* INPUT */
+.message-input {
+  display: flex;
 
-.input-row {
+  gap: 10px;
 
-  display:flex;
-
-  gap:9px;
-
-  margin-top:12px;
+  padding: 0 20px 18px;
 }
 
-#messageInput {
+.message-input input {
+  flex: 1;
 
-  flex:1;
+  min-width: 0;
 
-  min-width:0;
+  padding: 14px 18px;
 
-  padding:
-    15px
-    18px;
-
-  border-radius:28px;
-
-  background:#0c1426;
+  border-radius: 25px;
 
   border:
     1px solid #34415d;
 
-  color:white;
+  outline: none;
 
-  outline:none;
+  background: #0c1426;
+
+  color: white;
 }
 
 .send {
+  width: 52px;
+  height: 52px;
 
-  width:52px;
-  height:52px;
+  border: 0;
 
-  border-radius:50%;
+  border-radius: 50%;
 
-  border:0;
-
-  color:white;
+  color: white;
 
   background:
     linear-gradient(
@@ -1212,45 +1235,42 @@ button {
     );
 }
 
-/* ACTIONS */
-
 .actions {
-
-  display:grid;
+  display: grid;
 
   grid-template-columns:
-    1fr
-    2fr;
+    1fr 2fr;
 
-  gap:10px;
+  gap: 12px;
 
-  margin-top:15px;
+  padding: 18px;
+
+  border-top:
+    1px solid #202b42;
 }
 
-.action {
+.end,
+.next {
+  padding: 14px;
 
-  padding:15px;
+  border-radius: 12px;
 
-  border-radius:13px;
-
-  font-weight:800;
+  font-weight: 800;
 }
 
 .end {
-
-  color:#fb7185;
-
-  background:#0b1222;
+  background: #0b1222;
 
   border:
-    1px solid #27334d;
+    1px solid #202b42;
+
+  color: #fb7185;
 }
 
 .next {
+  border: 0;
 
-  border:0;
-
-  color:white;
+  color: white;
 
   background:
     linear-gradient(
@@ -1260,152 +1280,130 @@ button {
     );
 }
 
-/* REPORT MODAL */
+/* MODAL */
 
 .modal {
+  position: fixed;
 
-  position:fixed;
+  inset: 0;
 
-  inset:0;
+  display: none;
 
-  background:
-    rgba(0,0,0,.75);
+  align-items: center;
 
-  display:none;
+  justify-content: center;
 
-  align-items:center;
+  padding: 20px;
 
-  justify-content:center;
+  background: rgba(0,0,0,.72);
 
-  padding:20px;
-
-  z-index:100;
+  z-index: 100;
 }
 
 .modal.show {
-  display:flex;
+  display: flex;
 }
 
 .modal-box {
+  width: min(430px,100%);
 
-  width:
-    min(
-      420px,
-      100%
-    );
+  padding: 24px;
 
-  background:#0b1222;
+  border-radius: 18px;
 
   border:
-    1px solid #293651;
+    1px solid #34415d;
 
-  border-radius:20px;
-
-  padding:22px;
-
-  box-shadow:
-    0 25px 80px
-    rgba(0,0,0,.5);
+  background: #0b1222;
 }
 
 .modal-box h2 {
-  margin-top:0;
+  margin-top: 0;
 }
 
-.reason {
+.modal-box select,
+.modal-box textarea {
+  width: 100%;
 
-  width:100%;
+  margin-bottom: 12px;
 
-  text-align:left;
+  padding: 12px;
 
-  padding:13px;
-
-  margin:
-    6px
-    0;
-
-  border-radius:11px;
-
-  background:#111a2d;
+  border-radius: 10px;
 
   border:
-    1px solid #27334d;
+    1px solid #34415d;
 
-  color:white;
+  background: #111a2d;
+
+  color: white;
 }
 
-.reason:hover {
-  background:#1a2540;
+.modal-buttons {
+  display: flex;
+
+  gap: 10px;
 }
 
-.close-modal {
+.modal-buttons button {
+  flex: 1;
 
-  width:100%;
+  padding: 12px;
 
-  margin-top:10px;
+  border-radius: 10px;
 
-  padding:12px;
-
-  border-radius:11px;
-
-  border:
-    1px solid #27334d;
-
-  background:transparent;
-
-  color:#cbd5e1;
+  border: 0;
 }
 
-/* FOOTER */
+.cancel {
+  background: #182238;
 
-.footer {
+  color: white;
+}
 
-  text-align:center;
+.submit-report {
+  background: #dc2626;
 
-  padding:
-    20px
-    20px
-    45px;
-
-  color:#64748b;
+  color: white;
 }
 
 /* MOBILE */
 
-@media(max-width:700px) {
+@media(max-width:800px) {
+
+  .nav-links {
+    display: none;
+  }
 
   .hero {
-    padding-top:40px;
+    grid-template-columns: 1fr;
+
+    padding-top: 45px;
   }
 
-  .hero h1 {
-    font-size:50px;
+  .layout {
+    grid-template-columns: 1fr;
   }
 
-  .content {
-    padding:14px;
-  }
-
-  .video-box {
-    height:430px;
-  }
-
-  #localVideo {
-    width:115px;
-    height:160px;
+  .sidebar {
+    display: none;
   }
 
   .actions {
-    grid-template-columns:1fr;
+    grid-template-columns: 1fr;
   }
 
-  .status {
-    align-items:flex-start;
-    gap:10px;
+  .video-box {
+    height: 390px;
   }
 
-  .report-btn {
-    flex-shrink:0;
+  #localVideo {
+    width: 115px;
+    height: 150px;
+  }
+
+  .message {
+    max-width: 85%;
   }
 }
 
@@ -1420,14 +1418,14 @@ button {
 <div class="nav-inner">
 
 <div class="logo">
-
-<div class="logo-icon">
-💬
+💬 Random<span>Talk</span>
 </div>
 
-Random<span>Talk</span>
-
-</div>
+<nav class="nav-links">
+<a href="#">Home</a>
+<a href="#chat">Chat</a>
+<a href="#safety">Safety</a>
+</nav>
 
 </div>
 
@@ -1438,8 +1436,11 @@ Random<span>Talk</span>
 
 <section class="hero container">
 
+<div>
+
 <h1>
-Talk to someone
+Talk to<br>
+someone
 <span class="gradient">new.</span>
 </h1>
 
@@ -1448,12 +1449,25 @@ Meet random people through
 text or video chat.
 </p>
 
+<div class="hero-buttons">
+
 <button
 class="primary"
-onclick="goChat()"
+onclick="startFromHero()"
 >
 🚀 Start Chatting
 </button>
+
+<button
+class="secondary"
+onclick="alert('Choose Text Chat or Video Chat, then press Start Chatting.')"
+>
+▶ How it works
+</button>
+
+</div>
+
+</div>
 
 </section>
 
@@ -1468,16 +1482,16 @@ id="chat"
 <div class="tabs">
 
 <button
-class="tab active"
 id="textTab"
+class="tab active"
 onclick="selectText()"
 >
 💬 Text Chat
 </button>
 
 <button
-class="tab"
 id="videoTab"
+class="tab"
 onclick="selectVideo()"
 >
 🎥 Video Chat
@@ -1486,23 +1500,124 @@ onclick="selectVideo()"
 </div>
 
 
-<div class="status">
+<div class="layout">
+
+
+<aside class="sidebar">
+
+<h3>⚙️ Preferences</h3>
+
+<div class="preference">
+
+<div class="preference-title">
+Chat with
+</div>
+
+<div class="preference-buttons">
+
+<button
+id="everyoneBtn"
+class="selected"
+onclick="chooseEveryone()"
+>
+Everyone
+</button>
+
+<button
+id="genderBtn"
+onclick="chooseGender()"
+>
+Gender
+</button>
+
+</div>
+
+</div>
+
+
+<div class="preference">
+
+<div class="preference-title">
+Country
+</div>
+
+<select
+id="country"
+class="select-box"
+>
+
+<option value="any">
+Any country
+</option>
+
+<option value="india">
+India 🇮🇳
+</option>
+
+<option value="usa">
+United States 🇺🇸
+</option>
+
+<option value="uk">
+United Kingdom 🇬🇧
+</option>
+
+<option value="canada">
+Canada 🇨🇦
+</option>
+
+</select>
+
+</div>
+
+
+<button
+class="save-btn"
+onclick="savePreferences()"
+>
+✨ Save Preferences
+</button>
+
+
+<div
+class="tips"
+id="safety"
+style="
+margin-top:25px;
+color:#94a3b8;
+line-height:1.8;
+"
+>
+
+<b>Safety</b><br>
+
+• Be respectful<br>
+• Don't share personal information<br>
+• Report inappropriate users<br>
+• You can leave anytime
+
+</div>
+
+</aside>
+
+
+<section class="chat-panel">
+
+
+<div class="chat-header">
 
 <div>
 
 <div
-id="statusTitle"
-class="status-title waiting"
+id="status"
+class="status"
 >
 ● Ready
 </div>
 
-<div
-id="statusText"
-class="status-text"
->
-Press Start Chatting to find someone
-</div>
+<small id="statusText">
+Press Start Chatting
+</small>
 
 </div>
 
@@ -1516,12 +1631,9 @@ onclick="openReport()"
 </div>
 
 
-<div class="content">
-
-
 <div
-class="video-area"
 id="videoArea"
+class="video-area"
 >
 
 <div class="video-box">
@@ -1546,20 +1658,18 @@ class="video-placeholder"
 
 <div>
 
-<div class="video-placeholder-icon">
+<div style="font-size:55px">
 🎥
 </div>
 
 <div id="videoPlaceholderText">
-Press Start Chatting to begin
+Waiting for video...
 </div>
 
 </div>
 
 </div>
 
-<div class="video-label">
-Stranger
 </div>
 
 </div>
@@ -1567,13 +1677,12 @@ Stranger
 
 <div
 id="videoControls"
-class="controls"
+class="video-controls"
 >
 
 <button
 class="control"
 onclick="toggleCamera()"
-id="cameraButton"
 >
 📷 Camera On
 </button>
@@ -1581,12 +1690,9 @@ id="cameraButton"
 <button
 class="control"
 onclick="toggleMicrophone()"
-id="micButton"
 >
 🎤 Microphone On
 </button>
-
-</div>
 
 </div>
 
@@ -1601,17 +1707,16 @@ class="messages"
 </div>
 
 <div class="message received">
-Choose Text or Video, then press Start Chatting.
+Press Start Chatting to find someone.
 </div>
 
 </div>
 
 
-<div class="input-row">
+<div class="message-input">
 
 <input
 id="messageInput"
-type="text"
 placeholder="Start a chat first..."
 disabled
 onkeydown="handleEnter(event)"
@@ -1630,15 +1735,15 @@ onclick="sendMessage()"
 <div class="actions">
 
 <button
-class="action end"
+class="end"
 onclick="endChat()"
 >
 ⏹ End Chat
 </button>
 
 <button
-class="action next"
-id="mainButton"
+id="nextButton"
+class="next"
 onclick="startOrNext()"
 >
 🚀 Start Chatting
@@ -1646,6 +1751,7 @@ onclick="startOrNext()"
 
 </div>
 
+</section>
 
 </div>
 
@@ -1654,13 +1760,6 @@ onclick="startOrNext()"
 </section>
 
 </main>
-
-
-<footer class="footer">
-
-RandomTalk © 2026 · Talk safely. Meet someone new.
-
-</footer>
 
 
 <!-- REPORT MODAL -->
@@ -1672,64 +1771,67 @@ class="modal"
 
 <div class="modal-box">
 
-<h2>
-⚠ Report Stranger
-</h2>
+<h2>⚠ Report User</h2>
 
-<p
-style="color:#94a3b8"
->
-Select the reason for your report.
+<p style="color:#94a3b8">
+Tell us what happened.
 </p>
 
-<button
-class="reason"
-onclick="submitReport('nudity')"
->
-🔞 Nudity / sexual content
-</button>
+<select id="reportReason">
+
+<option value="Harassment">
+Harassment
+</option>
+
+<option value="Sexual content">
+Sexual content
+</option>
+
+<option value="Hate or abuse">
+Hate or abuse
+</option>
+
+<option value="Spam">
+Spam
+</option>
+
+<option value="Scam">
+Scam
+</option>
+
+<option value="Inappropriate behavior">
+Inappropriate behavior
+</option>
+
+<option value="Other">
+Other
+</option>
+
+</select>
+
+<textarea
+id="reportDetails"
+rows="4"
+placeholder="Optional details..."
+></textarea>
+
+<div class="modal-buttons">
 
 <button
-class="reason"
-onclick="submitReport('harassment')"
->
-😡 Harassment / bullying
-</button>
-
-<button
-class="reason"
-onclick="submitReport('threats')"
->
-⚠️ Threats / violence
-</button>
-
-<button
-class="reason"
-onclick="submitReport('spam')"
->
-🚨 Spam / scam
-</button>
-
-<button
-class="reason"
-onclick="submitReport('underage')"
->
-🛡️ Underage concern
-</button>
-
-<button
-class="reason"
-onclick="submitReport('other')"
->
-📝 Other
-</button>
-
-<button
-class="close-modal"
+class="cancel"
 onclick="closeReport()"
 >
 Cancel
 </button>
+
+<button
+class="submit-report"
+onclick="submitReport()"
+>
+Submit Report
+</button>
+
+</div>
 
 </div>
 
@@ -1738,11 +1840,13 @@ Cancel
 
 <script>
 
+/* =========================================================
+   STATE
+========================================================= */
+
 let socket = null;
 
 let connected = false;
-
-let intentionallyClosed = false;
 
 let currentMode = "text";
 
@@ -1759,11 +1863,9 @@ let microphoneEnabled = true;
 let pendingIceCandidates = [];
 
 
-/*
-========================================================
- WEBRTC
-========================================================
-*/
+/* =========================================================
+   WEBRTC
+========================================================= */
 
 const rtcConfig = {
 
@@ -1780,25 +1882,15 @@ const rtcConfig = {
     }
 
   ]
+
 };
 
 
-/*
-========================================================
- MODE
-========================================================
-*/
+/* =========================================================
+   MODE
+========================================================= */
 
 function selectText() {
-
-  if (connected) {
-
-    alert(
-      "End the current chat before changing mode."
-    );
-
-    return;
-  }
 
   currentMode = "text";
 
@@ -1822,15 +1914,6 @@ function selectText() {
 
 function selectVideo() {
 
-  if (connected) {
-
-    alert(
-      "End the current chat before changing mode."
-    );
-
-    return;
-  }
-
   currentMode = "video";
 
   document
@@ -1851,11 +1934,9 @@ function selectVideo() {
 }
 
 
-/*
-========================================================
- SOCKET
-========================================================
-*/
+/* =========================================================
+   SOCKET
+========================================================= */
 
 function connectSocket() {
 
@@ -1868,8 +1949,6 @@ function connectSocket() {
   ) {
     return;
   }
-
-  intentionallyClosed = false;
 
   const protocol =
     location.protocol === "https:"
@@ -1887,7 +1966,7 @@ function connectSocket() {
 
   socket.addEventListener(
     "open",
-    () => {
+    function() {
 
       updateStatus(
         "● Searching...",
@@ -1897,14 +1976,10 @@ function connectSocket() {
         false
       );
 
-      setButton(
-        "⏳ Searching..."
-      );
-
       socket.send(
         JSON.stringify({
-          type:"join",
-          mode:currentMode
+          type: "join",
+          mode: currentMode
         })
       );
     }
@@ -1913,28 +1988,21 @@ function connectSocket() {
 
   socket.addEventListener(
     "message",
-    async event => {
+    async function(event) {
 
       let data;
 
       try {
-
         data =
           JSON.parse(event.data);
-
       } catch {
-
         return;
       }
 
 
-      /*
-      WAITING
-      */
+      /* WAITING */
 
-      if (
-        data.type === "waiting"
-      ) {
+      if (data.type === "waiting") {
 
         connected = false;
 
@@ -1952,23 +2020,13 @@ function connectSocket() {
           "⏳ Searching..."
         );
 
-        if (data.mode === "video") {
-
-          showVideoWaiting();
-
-        }
-
         return;
       }
 
 
-      /*
-      MATCHED
-      */
+      /* MATCHED */
 
-      if (
-        data.type === "matched"
-      ) {
+      if (data.type === "matched") {
 
         connected = true;
 
@@ -1983,19 +2041,17 @@ function connectSocket() {
         updateStatus(
           "● Connected",
           currentMode === "video"
-            ? "Starting video connection..."
-            : "You are chatting with a random stranger",
+            ? "Starting video..."
+            : "You are chatting with a stranger.",
           true
         );
 
         enableInput();
 
-        setButton(
-          "⏭ Next"
-        );
+        setButton("⏭ Next");
 
         addSystemMessage(
-          "🎉 You are connected! Say hello."
+          "🎉 Connected! Say hello."
         );
 
 
@@ -2003,7 +2059,7 @@ function connectSocket() {
           currentMode === "video"
         ) {
 
-          selectVideoForced();
+          selectVideo();
 
           try {
 
@@ -2012,19 +2068,18 @@ function connectSocket() {
             await createPeerConnection();
 
             if (isInitiator) {
-
               await createOffer();
-
             }
 
           } catch (error) {
 
             console.error(
+              "Camera error:",
               error
             );
 
             addSystemMessage(
-              "⚠️ Camera or microphone could not start. Check browser permissions."
+              "⚠️ Camera/microphone permission failed."
             );
           }
         }
@@ -2033,13 +2088,9 @@ function connectSocket() {
       }
 
 
-      /*
-      CHAT
-      */
+      /* CHAT */
 
-      if (
-        data.type === "chat"
-      ) {
+      if (data.type === "chat") {
 
         addReceivedMessage(
           data.text
@@ -2049,13 +2100,9 @@ function connectSocket() {
       }
 
 
-      /*
-      SIGNAL
-      */
+      /* SIGNAL */
 
-      if (
-        data.type === "signal"
-      ) {
+      if (data.type === "signal") {
 
         try {
 
@@ -2066,19 +2113,16 @@ function connectSocket() {
         } catch (error) {
 
           console.error(
-            "WebRTC signal error:",
+            "Signal error:",
             error
           );
-
         }
 
         return;
       }
 
 
-      /*
-      PARTNER LEFT
-      */
+      /* PARTNER LEFT */
 
       if (
         data.type === "partner_left"
@@ -2101,16 +2145,14 @@ function connectSocket() {
         );
 
         addSystemMessage(
-          "👋 Stranger left. Looking for another person..."
+          "👋 Stranger left. Searching..."
         );
 
         return;
       }
 
 
-      /*
-      REPORT SUCCESS
-      */
+      /* REPORT SUCCESS */
 
       if (
         data.type === "report_success"
@@ -2119,25 +2161,7 @@ function connectSocket() {
         closeReport();
 
         alert(
-          "✅ " +
-          data.message
-        );
-
-        return;
-      }
-
-
-      /*
-      REPORT ERROR
-      */
-
-      if (
-        data.type === "report_error"
-      ) {
-
-        alert(
-          "❌ " +
-          data.message
+          "✅ Report submitted successfully."
         );
 
         return;
@@ -2149,120 +2173,84 @@ function connectSocket() {
 
   socket.addEventListener(
     "close",
-    () => {
+    function() {
 
       connected = false;
 
       closePeerConnection();
 
-      if (
-        !intentionallyClosed
-      ) {
-
-        updateStatus(
-          "● Disconnected",
-          "Connection lost. Press Start Chatting.",
-          false
-        );
-
-        disableInput();
-
-        setButton(
-          "🚀 Start Chatting"
-        );
-      }
-    }
-  );
-
-
-  socket.addEventListener(
-    "error",
-    () => {
-
       updateStatus(
-        "● Connection error",
-        "Could not connect. Try again.",
+        "● Disconnected",
+        "Press Start Chatting.",
         false
       );
+
+      disableInput();
 
       setButton(
         "🚀 Start Chatting"
       );
     }
   );
+
+
+  socket.addEventListener(
+    "error",
+    function() {
+
+      updateStatus(
+        "● Connection error",
+        "Please try again.",
+        false
+      );
+    }
+  );
 }
 
 
-/*
-========================================================
- CAMERA
-========================================================
-*/
+/* =========================================================
+   CAMERA
+========================================================= */
 
 async function startLocalMedia() {
 
-  if (
-    localStream
-  ) {
-
-    const localVideo =
-      document.getElementById(
-        "localVideo"
-      );
-
-    localVideo.srcObject =
-      localStream;
-
+  if (localStream) {
     return localStream;
   }
-
 
   if (
     !navigator.mediaDevices ||
     !navigator.mediaDevices.getUserMedia
   ) {
-
     throw new Error(
-      "Camera API unavailable"
+      "Camera API unavailable."
     );
   }
 
-
   localStream =
-    await navigator
-      .mediaDevices
-      .getUserMedia({
+    await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "user"
+      },
+      audio: true
+    });
 
-        video: {
-          facingMode:"user"
-        },
-
-        audio:true
-
-      });
-
-
-  const localVideo =
+  const video =
     document.getElementById(
       "localVideo"
     );
 
-  localVideo.srcObject =
+  video.srcObject =
     localStream;
 
-  localVideo.muted =
-    true;
+  video.muted = true;
 
-  await localVideo
-    .play()
-    .catch(() => {});
+  await video.play()
+    .catch(function() {});
 
+  cameraEnabled = true;
 
-  cameraEnabled =
-    true;
-
-  microphoneEnabled =
-    true;
+  microphoneEnabled = true;
 
   updateVideoButtons();
 
@@ -2270,21 +2258,15 @@ async function startLocalMedia() {
 }
 
 
-/*
-========================================================
- PEER CONNECTION
-========================================================
-*/
+/* =========================================================
+   PEER CONNECTION
+========================================================= */
 
 async function createPeerConnection() {
 
-  if (
-    peerConnection
-  ) {
-
+  if (peerConnection) {
     return peerConnection;
   }
-
 
   peerConnection =
     new RTCPeerConnection(
@@ -2292,14 +2274,12 @@ async function createPeerConnection() {
     );
 
 
-  if (
-    localStream
-  ) {
+  if (localStream) {
 
     localStream
       .getTracks()
       .forEach(
-        track => {
+        function(track) {
 
           peerConnection.addTrack(
             track,
@@ -2313,42 +2293,35 @@ async function createPeerConnection() {
 
   peerConnection.addEventListener(
     "track",
-    event => {
+    function(event) {
 
       if (
         !event.streams ||
         !event.streams[0]
       ) {
-
         return;
       }
 
-
-      const remoteVideo =
+      const remote =
         document.getElementById(
           "remoteVideo"
         );
 
-      remoteVideo.srcObject =
+      remote.srcObject =
         event.streams[0];
 
-      remoteVideo
-        .play()
-        .catch(() => {});
+      remote.play()
+        .catch(function() {});
 
-
-      const placeholder =
-        document.getElementById(
+      document
+        .getElementById(
           "videoPlaceholder"
-        );
-
-      placeholder.style.display =
-        "none";
-
+        )
+        .style.display = "none";
 
       updateStatus(
         "● Connected",
-        "You are on a video call with a stranger",
+        "You are on a video call.",
         true
       );
     }
@@ -2357,32 +2330,25 @@ async function createPeerConnection() {
 
   peerConnection.addEventListener(
     "icecandidate",
-    event => {
+    function(event) {
 
       if (
         !event.candidate ||
         !socket ||
-        socket.readyState !== WebSocket.OPEN
+        socket.readyState !==
+          WebSocket.OPEN
       ) {
-
         return;
       }
 
-
       socket.send(
         JSON.stringify({
-
-          type:"signal",
-
+          type: "signal",
           signal: {
-
-            type:"ice",
-
+            type: "ice",
             candidate:
               event.candidate
-
           }
-
         })
       );
     }
@@ -2391,19 +2357,20 @@ async function createPeerConnection() {
 
   peerConnection.addEventListener(
     "connectionstatechange",
-    () => {
+    function() {
 
-      if (
-        !peerConnection
-      ) {
-
+      if (!peerConnection) {
         return;
       }
 
-
       const state =
-        peerConnection.connectionState;
+        peerConnection
+          .connectionState;
 
+      console.log(
+        "WebRTC:",
+        state
+      );
 
       if (
         state === "connected"
@@ -2413,127 +2380,95 @@ async function createPeerConnection() {
           .getElementById(
             "videoPlaceholder"
           )
-          .style.display =
-          "none";
+          .style.display = "none";
 
         updateStatus(
           "● Connected",
-          "You are on a video call with a stranger",
+          "You are on a video call.",
           true
         );
       }
-
 
       if (
         state === "failed"
       ) {
 
-        const placeholder =
-          document.getElementById(
+        document
+          .getElementById(
             "videoPlaceholder"
-          );
-
-        placeholder.style.display =
-          "grid";
+          )
+          .style.display = "grid";
 
         document
           .getElementById(
             "videoPlaceholderText"
           )
           .textContent =
-          "Video connection failed. Try Next.";
+            "Video connection failed. Try Next.";
       }
-
     }
   );
-
 
   return peerConnection;
 }
 
 
-/*
-========================================================
- OFFER
-========================================================
-*/
+/* =========================================================
+   OFFER
+========================================================= */
 
 async function createOffer() {
 
-  if (
-    !peerConnection
-  ) {
-
+  if (!peerConnection) {
     return;
   }
 
-
   const offer =
-    await peerConnection
-      .createOffer();
+    await peerConnection.createOffer();
 
-
-  await peerConnection
-    .setLocalDescription(
-      offer
-    );
-
+  await peerConnection.setLocalDescription(
+    offer
+  );
 
   if (
     socket &&
-    socket.readyState === WebSocket.OPEN
+    socket.readyState ===
+      WebSocket.OPEN
   ) {
 
     socket.send(
       JSON.stringify({
-
-        type:"signal",
-
+        type: "signal",
         signal: {
-
-          type:"offer",
-
-          sdp:offer
-
+          type: "offer",
+          sdp: offer
         }
-
       })
     );
   }
 }
 
 
-/*
-========================================================
- SIGNAL HANDLING
-========================================================
-*/
+/* =========================================================
+   SIGNAL
+========================================================= */
 
 async function handleSignal(
   signal
 ) {
 
-  if (
-    !signal
-  ) {
-
+  if (!signal) {
     return;
   }
 
 
-  if (
-    !peerConnection
-  ) {
+  if (!peerConnection) {
 
     await startLocalMedia();
 
     await createPeerConnection();
   }
 
-
-  /*
-  OFFER
-  */
 
   if (
     signal.type === "offer"
@@ -2546,44 +2481,30 @@ async function handleSignal(
         )
       );
 
-
     await flushPendingIce();
-
 
     const answer =
       await peerConnection
         .createAnswer();
-
 
     await peerConnection
       .setLocalDescription(
         answer
       );
 
-
     socket.send(
       JSON.stringify({
-
-        type:"signal",
-
+        type: "signal",
         signal: {
-
-          type:"answer",
-
-          sdp:answer
-
+          type: "answer",
+          sdp: answer
         }
-
       })
     );
 
     return;
   }
 
-
-  /*
-  ANSWER
-  */
 
   if (
     signal.type === "answer"
@@ -2596,16 +2517,11 @@ async function handleSignal(
         )
       );
 
-
     await flushPendingIce();
 
     return;
   }
 
-
-  /*
-  ICE
-  */
 
   if (
     signal.type === "ice" &&
@@ -2613,8 +2529,7 @@ async function handleSignal(
   ) {
 
     if (
-      peerConnection.remoteDescription &&
-      peerConnection.remoteDescription.type
+      peerConnection.remoteDescription
     ) {
 
       try {
@@ -2626,11 +2541,10 @@ async function handleSignal(
             )
           );
 
-      } catch (
-        error
-      ) {
+      } catch (error) {
 
         console.error(
+          "ICE error:",
           error
         );
       }
@@ -2645,33 +2559,23 @@ async function handleSignal(
 }
 
 
-/*
-========================================================
- ICE QUEUE
-========================================================
-*/
+/* =========================================================
+   ICE
+========================================================= */
 
 async function flushPendingIce() {
 
-  if (
-    !peerConnection
-  ) {
-
+  if (!peerConnection) {
     return;
   }
 
-
-  const candidates =
+  const list =
     pendingIceCandidates;
 
-
-  pendingIceCandidates =
-    [];
-
+  pendingIceCandidates = [];
 
   for (
-    const candidate
-    of candidates
+    const candidate of list
   ) {
 
     try {
@@ -2683,12 +2587,10 @@ async function flushPendingIce() {
           )
         );
 
-    } catch (
-      error
-    ) {
+    } catch (error) {
 
       console.error(
-        "ICE queue error:",
+        "Queued ICE error:",
         error
       );
     }
@@ -2696,258 +2598,117 @@ async function flushPendingIce() {
 }
 
 
-/*
-========================================================
- CLOSE VIDEO
-========================================================
-*/
+/* =========================================================
+   CLOSE VIDEO
+========================================================= */
 
 function closePeerConnection() {
 
-  pendingIceCandidates =
-    [];
+  pendingIceCandidates = [];
 
-
-  if (
-    peerConnection
-  ) {
+  if (peerConnection) {
 
     try {
-
       peerConnection.close();
-
     } catch {}
 
-    peerConnection =
-      null;
+    peerConnection = null;
   }
 
-
-  const remoteVideo =
+  const remote =
     document.getElementById(
       "remoteVideo"
     );
 
-
-  if (
-    remoteVideo
-  ) {
-
-    remoteVideo.srcObject =
-      null;
+  if (remote) {
+    remote.srcObject = null;
   }
-
-
-  showVideoWaiting();
-}
-
-
-function showVideoWaiting() {
 
   const placeholder =
     document.getElementById(
       "videoPlaceholder"
     );
 
-  const text =
-    document.getElementById(
-      "videoPlaceholderText"
-    );
-
-
-  if (
-    placeholder
-  ) {
-
+  if (placeholder) {
     placeholder.style.display =
       "grid";
   }
-
-
-  if (
-    text
-  ) {
-
-    text.textContent =
-      "Waiting for stranger's video...";
-  }
 }
 
 
-/*
-========================================================
- VIDEO MODE FORCED
-========================================================
-*/
-
-function selectVideoForced() {
-
-  currentMode =
-    "video";
-
-  document
-    .getElementById(
-      "videoTab"
-    )
-    .classList.add(
-      "active"
-    );
-
-  document
-    .getElementById(
-      "textTab"
-    )
-    .classList.remove(
-      "active"
-    );
-
-  document
-    .getElementById(
-      "videoArea"
-    )
-    .classList.add(
-      "show"
-    );
-
-  document
-    .getElementById(
-      "videoControls"
-    )
-    .classList.add(
-      "show"
-    );
-}
-
-
-/*
-========================================================
- CAMERA TOGGLE
-========================================================
-*/
+/* =========================================================
+   CAMERA / MICROPHONE
+========================================================= */
 
 function toggleCamera() {
 
-  if (
-    !localStream
-  ) {
-
+  if (!localStream) {
     return;
   }
-
 
   const tracks =
-    localStream
-      .getVideoTracks();
+    localStream.getVideoTracks();
 
-
-  if (
-    !tracks.length
-  ) {
-
+  if (!tracks.length) {
     return;
   }
-
 
   cameraEnabled =
     !cameraEnabled;
 
-
   tracks.forEach(
-    track => {
-
+    function(track) {
       track.enabled =
         cameraEnabled;
-
     }
   );
-
 
   updateVideoButtons();
 }
 
 
-/*
-========================================================
- MICROPHONE TOGGLE
-========================================================
-*/
-
 function toggleMicrophone() {
 
-  if (
-    !localStream
-  ) {
-
+  if (!localStream) {
     return;
   }
-
 
   const tracks =
-    localStream
-      .getAudioTracks();
+    localStream.getAudioTracks();
 
-
-  if (
-    !tracks.length
-  ) {
-
+  if (!tracks.length) {
     return;
   }
-
 
   microphoneEnabled =
     !microphoneEnabled;
 
-
   tracks.forEach(
-    track => {
-
+    function(track) {
       track.enabled =
         microphoneEnabled;
-
     }
   );
-
 
   updateVideoButtons();
 }
 
 
-/*
-========================================================
- VIDEO BUTTONS
-========================================================
-*/
-
 function updateVideoButtons() {
 
-  const camera =
-    document.getElementById(
-      "cameraButton"
+  const buttons =
+    document.querySelectorAll(
+      ".control"
     );
 
-  const mic =
-    document.getElementById(
-      "micButton"
-    );
+  if (buttons.length >= 2) {
 
-
-  if (
-    camera
-  ) {
-
-    camera.textContent =
+    buttons[0].textContent =
       cameraEnabled
         ? "📷 Camera On"
         : "📷 Camera Off";
-  }
 
-
-  if (
-    mic
-  ) {
-
-    mic.textContent =
+    buttons[1].textContent =
       microphoneEnabled
         ? "🎤 Microphone On"
         : "🔇 Microphone Off";
@@ -2955,21 +2716,33 @@ function updateVideoButtons() {
 }
 
 
-/*
-========================================================
- START / NEXT
-========================================================
-*/
+/* =========================================================
+   START / NEXT
+========================================================= */
+
+function startFromHero() {
+
+  document
+    .getElementById("chat")
+    .scrollIntoView({
+      behavior: "smooth"
+    });
+
+  setTimeout(
+    function() {
+      startOrNext();
+    },
+    500
+  );
+}
+
 
 function startOrNext() {
 
-  /*
-    NEXT
-  */
-
   if (
     socket &&
-    socket.readyState === WebSocket.OPEN &&
+    socket.readyState ===
+      WebSocket.OPEN &&
     connected
   ) {
 
@@ -2979,21 +2752,17 @@ function startOrNext() {
 
     socket.send(
       JSON.stringify({
-        type:"next"
+        type: "next"
       })
     );
 
-
-    connected =
-      false;
-
+    connected = false;
 
     updateStatus(
       "● Searching...",
       "Finding another person...",
       false
     );
-
 
     disableInput();
 
@@ -3005,30 +2774,22 @@ function startOrNext() {
   }
 
 
-  /*
-    START
-  */
-
-  intentionallyClosed =
-    false;
-
-
   if (
     !socket ||
-    socket.readyState !== WebSocket.OPEN
+    socket.readyState !==
+      WebSocket.OPEN
   ) {
 
     connectSocket();
 
+    return;
   }
 }
 
 
-/*
-========================================================
- SEND MESSAGE
-========================================================
-*/
+/* =========================================================
+   CHAT
+========================================================= */
 
 function sendMessage() {
 
@@ -3037,52 +2798,33 @@ function sendMessage() {
       "messageInput"
     );
 
-
   const text =
     input.value.trim();
-
 
   if (
     !text ||
     !connected ||
     !socket ||
-    socket.readyState !== WebSocket.OPEN
+    socket.readyState !==
+      WebSocket.OPEN
   ) {
-
     return;
   }
 
-
   socket.send(
     JSON.stringify({
-
-      type:"chat",
-
+      type: "chat",
       text
-
     })
   );
 
+  addSentMessage(text);
 
-  addSentMessage(
-    text
-  );
-
-
-  input.value =
-    "";
+  input.value = "";
 }
 
 
-/*
-========================================================
- ENTER
-========================================================
-*/
-
-function handleEnter(
-  event
-) {
+function handleEnter(event) {
 
   if (
     event.key === "Enter"
@@ -3095,42 +2837,32 @@ function handleEnter(
 }
 
 
-/*
-========================================================
- END CHAT
-========================================================
-*/
+/* =========================================================
+   END
+========================================================= */
 
 function endChat() {
 
   if (
     socket &&
-    socket.readyState === WebSocket.OPEN
+    socket.readyState ===
+      WebSocket.OPEN
   ) {
 
     socket.send(
       JSON.stringify({
-        type:"end"
+        type: "end"
       })
     );
-
-
-    intentionallyClosed =
-      true;
-
 
     socket.close();
   }
 
-
-  connected =
-    false;
-
+  connected = false;
 
   closePeerConnection();
 
   disableInput();
-
 
   updateStatus(
     "● Offline",
@@ -3138,11 +2870,9 @@ function endChat() {
     false
   );
 
-
   setButton(
     "🚀 Start Chatting"
   );
-
 
   addSystemMessage(
     "Chat ended."
@@ -3150,67 +2880,181 @@ function endChat() {
 }
 
 
-/*
-========================================================
- STATUS
-========================================================
-*/
+/* =========================================================
+   REPORT
+========================================================= */
+
+function openReport() {
+
+  if (!connected) {
+
+    alert(
+      "You are not currently connected."
+    );
+
+    return;
+  }
+
+  document
+    .getElementById(
+      "reportModal"
+    )
+    .classList.add("show");
+}
+
+
+function closeReport() {
+
+  document
+    .getElementById(
+      "reportModal"
+    )
+    .classList.remove("show");
+}
+
+
+function submitReport() {
+
+  if (
+    !socket ||
+    socket.readyState !==
+      WebSocket.OPEN ||
+    !connected
+  ) {
+
+    alert(
+      "You are not currently connected."
+    );
+
+    return;
+  }
+
+  const reason =
+    document.getElementById(
+      "reportReason"
+    ).value;
+
+  const details =
+    document.getElementById(
+      "reportDetails"
+    ).value;
+
+  socket.send(
+    JSON.stringify({
+      type: "report",
+      reason,
+      details
+    })
+  );
+}
+
+
+/* =========================================================
+   PREFERENCES
+========================================================= */
+
+function chooseEveryone() {
+
+  document
+    .getElementById(
+      "everyoneBtn"
+    )
+    .classList.add("selected");
+
+  document
+    .getElementById(
+      "genderBtn"
+    )
+    .classList.remove("selected");
+}
+
+
+function chooseGender() {
+
+  document
+    .getElementById(
+      "genderBtn"
+    )
+    .classList.add("selected");
+
+  document
+    .getElementById(
+      "everyoneBtn"
+    )
+    .classList.remove("selected");
+
+  alert(
+    "Gender matching UI is ready. Matching rules can be connected next."
+  );
+}
+
+
+function savePreferences() {
+
+  const country =
+    document.getElementById(
+      "country"
+    ).value;
+
+  localStorage.setItem(
+    "randomtalk_country",
+    country
+  );
+
+  alert(
+    "✅ Preferences saved."
+  );
+}
+
+
+/* =========================================================
+   UI
+========================================================= */
 
 function updateStatus(
   title,
   text,
-  connectedStatus
+  connectedState
 ) {
 
   const status =
     document.getElementById(
-      "statusTitle"
+      "status"
     );
 
-
-  const description =
+  const statusText =
     document.getElementById(
       "statusText"
     );
 
-
   status.textContent =
     title;
 
-
-  description.textContent =
+  statusText.textContent =
     text;
 
+  if (connectedState) {
 
-  status.className =
-    connectedStatus
-      ? "status-title connected"
-      : "status-title waiting";
+    status.classList.add(
+      "connected"
+    );
+
+  } else {
+
+    status.classList.remove(
+      "connected"
+    );
+  }
 }
 
 
-/*
-========================================================
- BUTTON
-========================================================
-*/
-
-function setButton(
-  text
-) {
+function setButton(text) {
 
   document.getElementById(
-    "mainButton"
-  ).textContent =
-    text;
+    "nextButton"
+  ).textContent = text;
 }
 
-
-/*
-========================================================
- INPUT
-========================================================
-*/
 
 function enableInput() {
 
@@ -3219,10 +3063,7 @@ function enableInput() {
       "messageInput"
     );
 
-
-  input.disabled =
-    false;
-
+  input.disabled = false;
 
   input.placeholder =
     "Type a message...";
@@ -3236,119 +3077,85 @@ function disableInput() {
       "messageInput"
     );
 
-
-  input.disabled =
-    true;
-
+  input.disabled = true;
 
   input.placeholder =
     "Waiting for a stranger...";
 }
 
 
-/*
-========================================================
- MESSAGES
-========================================================
-*/
-
 function clearMessages() {
 
   document.getElementById(
     "messages"
-  ).innerHTML =
-    "";
+  ).innerHTML = "";
 }
 
 
-function addSystemMessage(
-  text
-) {
+function addSystemMessage(text) {
 
   const div =
     document.createElement(
       "div"
     );
 
-
   div.className =
     "message received";
 
-
   div.textContent =
     text;
-
 
   document
     .getElementById(
       "messages"
     )
-    .appendChild(
-      div
-    );
-
+    .appendChild(div);
 
   scrollMessages();
 }
 
 
-function addReceivedMessage(
-  text
-) {
+function addReceivedMessage(text) {
 
   const div =
     document.createElement(
       "div"
     );
 
-
   div.className =
     "message received";
 
-
   div.textContent =
     text;
-
 
   document
     .getElementById(
       "messages"
     )
-    .appendChild(
-      div
-    );
-
+    .appendChild(div);
 
   scrollMessages();
 }
 
 
-function addSentMessage(
-  text
-) {
+function addSentMessage(text) {
 
   const div =
     document.createElement(
       "div"
     );
-
 
   div.className =
     "message sent";
 
-
   div.textContent =
     text;
-
 
   document
     .getElementById(
       "messages"
     )
-    .appendChild(
-      div
-    );
-
+    .appendChild(div);
 
   scrollMessages();
 }
@@ -3361,109 +3168,34 @@ function scrollMessages() {
       "messages"
     );
 
-
   box.scrollTop =
     box.scrollHeight;
 }
 
 
-/*
-========================================================
- REPORT
-========================================================
-*/
-
-function openReport() {
-
-  if (
-    !connected
-  ) {
-
-    alert(
-      "You are not currently connected."
-    );
-
-    return;
-  }
-
-
-  document
-    .getElementById(
-      "reportModal"
-    )
-    .classList.add(
-      "show"
-    );
-}
-
-
-function closeReport() {
-
-  document
-    .getElementById(
-      "reportModal"
-    )
-    .classList.remove(
-      "show"
-    );
-}
-
-
-function submitReport(
-  reason
-) {
-
-  if (
-    !connected ||
-    !socket ||
-    socket.readyState !== WebSocket.OPEN
-  ) {
-
-    closeReport();
-
-    alert(
-      "You are not currently connected."
-    );
-
-    return;
-  }
-
-
-  socket.send(
-    JSON.stringify({
-
-      type:"report",
-
-      reason
-
-    })
-  );
-}
-
-
-/*
-========================================================
- PAGE
-========================================================
-*/
-
-function goChat() {
-
-  document
-    .getElementById(
-      "chat"
-    )
-    .scrollIntoView({
-      behavior:"smooth"
-    });
-}
-
+/* =========================================================
+   PAGE LOAD
+========================================================= */
 
 window.addEventListener(
   "load",
-  () => {
+  function() {
 
     selectText();
+
+    const saved =
+      localStorage.getItem(
+        "randomtalk_country"
+      );
+
+    if (saved) {
+
+      document
+        .getElementById(
+          "country"
+        )
+        .value = saved;
+    }
 
   }
 );
