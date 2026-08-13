@@ -1,9 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 
+const MAX_TEXT = 2000;
+
 /* =========================================================
-   RANDOMTALK
-   Text + Video + Random Matching + Gender + Country
-   Reports + Preferences + 18+ Safety Gate
+   RANDOMTALK - DURABLE OBJECT CHAT ROOM
+   Text + Video + Reports + Gender + Country Matching
 ========================================================= */
 
 export class ChatRoom extends DurableObject {
@@ -34,7 +35,7 @@ export class ChatRoom extends DurableObject {
     ws.serializeAttachment(info);
   }
 
-  findSocketById(id) {
+  findSocket(id) {
     if (!id) return null;
 
     for (const ws of this.ctx.getWebSockets()) {
@@ -48,17 +49,22 @@ export class ChatRoom extends DurableObject {
     return null;
   }
 
-  canMatch(a, b) {
+  /* =======================================================
+     MATCHING
+  ======================================================= */
+
+  compatible(a, b) {
 
     if (!a || !b) return false;
 
     if (a.status !== "waiting") return false;
     if (b.status !== "waiting") return false;
 
+    /* Text only matches text.
+       Video only matches video. */
     if (a.mode !== b.mode) return false;
 
-    /* COUNTRY */
-
+    /* Country */
     if (
       a.country !== "any" &&
       a.country !== b.country
@@ -73,8 +79,7 @@ export class ChatRoom extends DurableObject {
       return false;
     }
 
-    /* GENDER */
-
+    /* Gender preference A */
     if (
       a.chatWith === "gender" &&
       a.preferredGender !== "any" &&
@@ -83,6 +88,7 @@ export class ChatRoom extends DurableObject {
       return false;
     }
 
+    /* Gender preference B */
     if (
       b.chatWith === "gender" &&
       b.preferredGender !== "any" &&
@@ -100,7 +106,9 @@ export class ChatRoom extends DurableObject {
 
     for (const other of this.ctx.getWebSockets()) {
 
-      if (other === ws) continue;
+      if (other === ws) {
+        continue;
+      }
 
       if (other.readyState !== WebSocket.OPEN) {
         continue;
@@ -108,7 +116,7 @@ export class ChatRoom extends DurableObject {
 
       const otherInfo = this.getInfo(other);
 
-      if (this.canMatch(user, otherInfo)) {
+      if (this.compatible(user, otherInfo)) {
         return other;
       }
     }
@@ -116,63 +124,45 @@ export class ChatRoom extends DurableObject {
     return null;
   }
 
-  matchUsers(a, b) {
+  pairUsers(aWs, bWs) {
 
-    const aInfo = this.getInfo(a);
-    const bInfo = this.getInfo(b);
+    const a = this.getInfo(aWs);
+    const b = this.getInfo(bWs);
 
-    this.setInfo(a, {
-      ...aInfo,
+    if (!this.compatible(a, b)) {
+      return false;
+    }
+
+    this.setInfo(aWs, {
+      ...a,
       status: "matched",
-      partnerId: bInfo.id
+      partnerId: b.id
     });
 
-    this.setInfo(b, {
-      ...bInfo,
+    this.setInfo(bWs, {
+      ...b,
       status: "matched",
-      partnerId: aInfo.id
+      partnerId: a.id
     });
 
-    this.send(a, {
+    this.send(aWs, {
       type: "matched",
-      mode: aInfo.mode,
+      mode: a.mode,
       initiator: false
     });
 
-    this.send(b, {
+    this.send(bWs, {
       type: "matched",
-      mode: bInfo.mode,
+      mode: b.mode,
       initiator: true
     });
+
+    return true;
   }
 
-  tryMatch(ws) {
-
-    if (!ws) return;
-
-    if (ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    const info = this.getInfo(ws);
-
-    if (info.status !== "waiting") {
-      return;
-    }
-
-    const other = this.findMatch(ws);
-
-    if (!other) {
-      this.send(ws, {
-        type: "waiting",
-        mode: info.mode
-      });
-
-      return;
-    }
-
-    this.matchUsers(ws, other);
-  }
+  /* =======================================================
+     CONNECTION
+  ======================================================= */
 
   async fetch(request) {
 
@@ -180,12 +170,9 @@ export class ChatRoom extends DurableObject {
       request.headers.get("Upgrade")?.toLowerCase() !==
       "websocket"
     ) {
-
       return new Response(
         "RandomTalk ChatRoom is running.",
-        {
-          status: 200
-        }
+        { status: 200 }
       );
     }
 
@@ -194,15 +181,22 @@ export class ChatRoom extends DurableObject {
     const client = pair[0];
     const server = pair[1];
 
+    /*
+      Cloudflare Durable Object
+      WebSocket Hibernation API
+    */
+
     this.ctx.acceptWebSocket(server);
+
+    const id = crypto.randomUUID();
 
     this.setInfo(server, {
 
-      id: crypto.randomUUID(),
-
-      status: "idle",
+      id,
 
       mode: "text",
+
+      status: "idle",
 
       chatWith: "everyone",
 
@@ -224,20 +218,24 @@ export class ChatRoom extends DurableObject {
     });
   }
 
-  async webSocketMessage(ws, message) {
+  /* =======================================================
+     MESSAGE HANDLER
+  ======================================================= */
+
+  async webSocketMessage(ws, rawMessage) {
 
     let data;
 
     try {
 
-      if (typeof message === "string") {
+      if (typeof rawMessage === "string") {
 
-        data = JSON.parse(message);
+        data = JSON.parse(rawMessage);
 
       } else {
 
         data = JSON.parse(
-          new TextDecoder().decode(message)
+          new TextDecoder().decode(rawMessage)
         );
 
       }
@@ -255,7 +253,6 @@ export class ChatRoom extends DurableObject {
     if (!data || !data.type) {
       return;
     }
-
 
     /* =====================================================
        JOIN
@@ -276,16 +273,21 @@ export class ChatRoom extends DurableObject {
           : "everyone";
 
       const gender =
-        ["male", "female", "other"].includes(
-          data.gender
-        )
+        [
+          "male",
+          "female",
+          "other"
+        ].includes(data.gender)
           ? data.gender
           : "other";
 
       const preferredGender =
-        ["male", "female", "other", "any"].includes(
-          data.preferredGender
-        )
+        [
+          "male",
+          "female",
+          "other",
+          "any"
+        ].includes(data.preferredGender)
           ? data.preferredGender
           : "any";
 
@@ -301,6 +303,8 @@ export class ChatRoom extends DurableObject {
 
         mode,
 
+        status: "waiting",
+
         chatWith,
 
         gender,
@@ -309,25 +313,33 @@ export class ChatRoom extends DurableObject {
 
         country,
 
-        status: "waiting",
-
         partnerId: null
 
       };
 
       this.setInfo(ws, info);
 
-      this.tryMatch(ws);
+      const other = this.findMatch(ws);
+
+      if (!other) {
+
+        this.send(ws, {
+          type: "waiting",
+          mode
+        });
+
+        return;
+      }
+
+      this.pairUsers(ws, other);
 
       return;
     }
 
-
     const info = this.getInfo(ws);
 
-
     /* =====================================================
-       CHAT
+       CHAT MESSAGE
     ===================================================== */
 
     if (data.type === "chat") {
@@ -340,18 +352,20 @@ export class ChatRoom extends DurableObject {
       }
 
       const partner =
-        this.findSocketById(
-          info.partnerId
-        );
+        this.findSocket(info.partnerId);
 
-      if (!partner) return;
+      if (!partner) {
+        return;
+      }
 
       const text =
         String(data.text || "")
           .trim()
-          .slice(0, 2000);
+          .slice(0, MAX_TEXT);
 
-      if (!text) return;
+      if (!text) {
+        return;
+      }
 
       this.send(partner, {
         type: "chat",
@@ -360,7 +374,6 @@ export class ChatRoom extends DurableObject {
 
       return;
     }
-
 
     /* =====================================================
        WEBRTC SIGNAL
@@ -373,11 +386,11 @@ export class ChatRoom extends DurableObject {
       }
 
       const partner =
-        this.findSocketById(
-          info.partnerId
-        );
+        this.findSocket(info.partnerId);
 
-      if (!partner) return;
+      if (!partner) {
+        return;
+      }
 
       this.send(partner, {
         type: "signal",
@@ -387,55 +400,20 @@ export class ChatRoom extends DurableObject {
       return;
     }
 
-
     /* =====================================================
        NEXT
     ===================================================== */
 
     if (data.type === "next") {
 
-      const oldPartner =
-        info.partnerId
-          ? this.findSocketById(
-              info.partnerId
-            )
-          : null;
+      const partner =
+        this.findSocket(info.partnerId);
 
-
-      if (oldPartner) {
-
-        const partnerInfo =
-          this.getInfo(oldPartner);
-
-        this.setInfo(oldPartner, {
-          ...partnerInfo,
-
-          status: "waiting",
-
-          partnerId: null
-
-        });
-
-        this.send(oldPartner, {
-          type: "partner_left"
-        });
-
-        this.send(oldPartner, {
-          type: "waiting",
-          mode: partnerInfo.mode
-        });
-
-        this.tryMatch(oldPartner);
-      }
-
-
+      /* Put current user into waiting */
       this.setInfo(ws, {
         ...info,
-
         status: "waiting",
-
         partnerId: null
-
       });
 
       this.send(ws, {
@@ -443,11 +421,54 @@ export class ChatRoom extends DurableObject {
         mode: info.mode
       });
 
-      this.tryMatch(ws);
+      /* Put previous partner into waiting */
+      if (partner) {
+
+        const partnerInfo =
+          this.getInfo(partner);
+
+        this.setInfo(partner, {
+          ...partnerInfo,
+          status: "waiting",
+          partnerId: null
+        });
+
+        this.send(partner, {
+          type: "partner_left"
+        });
+
+        this.send(partner, {
+          type: "waiting",
+          mode: partnerInfo.mode
+        });
+
+        /* Try to find someone for old partner */
+        const partnerMatch =
+          this.findMatch(partner);
+
+        if (partnerMatch) {
+          this.pairUsers(
+            partner,
+            partnerMatch
+          );
+        }
+      }
+
+      /* Try to find someone for current user */
+      const match =
+        this.findMatch(ws);
+
+      if (match) {
+
+        this.pairUsers(
+          ws,
+          match
+        );
+
+      }
 
       return;
     }
-
 
     /* =====================================================
        END
@@ -456,11 +477,13 @@ export class ChatRoom extends DurableObject {
     if (data.type === "end") {
 
       const partner =
-        info.partnerId
-          ? this.findSocketById(
-              info.partnerId
-            )
-          : null;
+        this.findSocket(info.partnerId);
+
+      this.setInfo(ws, {
+        ...info,
+        status: "idle",
+        partnerId: null
+      });
 
       if (partner) {
 
@@ -469,30 +492,18 @@ export class ChatRoom extends DurableObject {
 
         this.setInfo(partner, {
           ...partnerInfo,
-
           status: "idle",
-
           partnerId: null
-
         });
 
         this.send(partner, {
-          type: "partner_left"
+          type: "partner_left",
+          ended: true
         });
       }
 
-      this.setInfo(ws, {
-        ...info,
-
-        status: "idle",
-
-        partnerId: null
-
-      });
-
       return;
     }
-
 
     /* =====================================================
        REPORT
@@ -502,7 +513,8 @@ export class ChatRoom extends DurableObject {
 
       const report = {
 
-        id: crypto.randomUUID(),
+        id:
+          crypto.randomUUID(),
 
         createdAt:
           new Date().toISOString(),
@@ -531,36 +543,37 @@ export class ChatRoom extends DurableObject {
 
       };
 
-
       await this.ctx.storage.put(
         "report:" + report.id,
         report
       );
-
 
       const oldCount =
         await this.ctx.storage.get(
           "report_count"
         );
 
-
-      const newCount =
+      const count =
         Number(oldCount || 0) + 1;
-
 
       await this.ctx.storage.put(
         "report_count",
-        newCount
+        count
       );
 
+      console.log(
+        "Report saved:",
+        report.id
+      );
 
       this.send(ws, {
-        type: "report_success"
+        type: "report_success",
+        message:
+          "Report submitted successfully."
       });
 
       return;
     }
-
 
     /* =====================================================
        PING
@@ -576,18 +589,17 @@ export class ChatRoom extends DurableObject {
     }
   }
 
+  /* =======================================================
+     CLOSE
+  ======================================================= */
 
   async webSocketClose(ws) {
 
     const info =
       this.getInfo(ws);
 
-    if (!info.partnerId) {
-      return;
-    }
-
     const partner =
-      this.findSocketById(
+      this.findSocket(
         info.partnerId
       );
 
@@ -600,11 +612,8 @@ export class ChatRoom extends DurableObject {
 
     this.setInfo(partner, {
       ...partnerInfo,
-
       status: "waiting",
-
       partnerId: null
-
     });
 
     this.send(partner, {
@@ -616,15 +625,109 @@ export class ChatRoom extends DurableObject {
       mode: partnerInfo.mode
     });
 
-    this.tryMatch(partner);
+    const match =
+      this.findMatch(partner);
+
+    if (match) {
+      this.pairUsers(
+        partner,
+        match
+      );
+    }
   }
 
+  /* =======================================================
+     ERROR
+  ======================================================= */
 
-  async webSocketError(ws) {
+  async webSocketError(ws, error) {
+
+    console.error(
+      "WebSocket error:",
+      error
+    );
 
     await this.webSocketClose(ws);
   }
 }
+
+
+/* =========================================================
+   MAIN WORKER
+========================================================= */
+
+export default {
+
+  async fetch(request, env) {
+
+    const url =
+      new URL(request.url);
+
+    /* -----------------------------------------------------
+       WEBSOCKET
+    ----------------------------------------------------- */
+
+    if (url.pathname === "/ws") {
+
+      if (
+        request.method !== "GET" ||
+        request.headers.get("Upgrade")?.toLowerCase() !==
+          "websocket"
+      ) {
+
+        return new Response(
+          "WebSocket upgrade required.",
+          { status: 426 }
+        );
+      }
+
+      const id =
+        env.CHAT.idFromName(
+          "global-chat-room"
+        );
+
+      const room =
+        env.CHAT.get(id);
+
+      return room.fetch(request);
+    }
+
+    /* -----------------------------------------------------
+       HEALTH
+    ----------------------------------------------------- */
+
+    if (url.pathname === "/health") {
+
+      return Response.json({
+
+        ok: true,
+
+        service: "RandomTalk",
+
+        time:
+          new Date().toISOString()
+
+      });
+    }
+
+    /* -----------------------------------------------------
+       WEBSITE
+    ----------------------------------------------------- */
+
+    return new Response(
+      HTML_PAGE,
+      {
+        headers: {
+          "content-type":
+            "text/html; charset=UTF-8",
+
+          "cache-control":
+            "no-store"
+        }
+      }
+    );
+  }
+};
 
 
 /* =========================================================
@@ -641,7 +744,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 
 <meta
   name="viewport"
-  content="width=device-width,initial-scale=1.0"
+  content="width=device-width,initial-scale=1"
 >
 
 <title>RandomTalk</title>
@@ -652,31 +755,19 @@ const HTML_PAGE = `<!DOCTYPE html>
   box-sizing: border-box;
 }
 
-html {
-  scroll-behavior: smooth;
-}
-
 body {
   margin: 0;
 
-  background:
-    radial-gradient(
-      circle at 80% 10%,
-      rgba(124,58,237,.22),
-      transparent 30%
-    ),
-    radial-gradient(
-      circle at 20% 80%,
-      rgba(217,70,239,.12),
-      transparent 30%
-    ),
-    #050816;
+  background: #050816;
 
   color: #f8fafc;
 
   font-family:
     Inter,
-    Arial,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
     sans-serif;
 }
 
@@ -691,25 +782,23 @@ button {
   cursor: pointer;
 }
 
-.container {
+.wrap {
   width:
     min(
-      1150px,
-      calc(100% - 30px)
+      1100px,
+      calc(100% - 28px)
     );
 
   margin: auto;
 }
 
-
 /* NAV */
 
-.navbar {
-  height: 72px;
+.nav {
+  height: 70px;
 
   border-bottom:
-    1px solid
-    rgba(148,163,184,.12);
+    1px solid #202b42;
 
   display: flex;
 
@@ -717,35 +806,41 @@ button {
 }
 
 .nav-inner {
-  width:
-    min(
-      1150px,
-      calc(100% - 30px)
-    );
-
-  margin: auto;
-
   display: flex;
 
-  align-items: center;
-
   justify-content: space-between;
+
+  align-items: center;
 }
 
 .logo {
   font-size: 24px;
+
   font-weight: 900;
 }
 
-.logo span {
+.logo b {
   color: #a855f7;
 }
 
+.links {
+  display: flex;
+
+  gap: 24px;
+}
+
+.links a {
+  color: #cbd5e1;
+
+  text-decoration: none;
+}
 
 /* HERO */
 
 .hero {
-  padding: 65px 0 40px;
+  padding:
+    65px 0
+    35px;
 }
 
 .hero h1 {
@@ -753,14 +848,14 @@ button {
 
   font-size:
     clamp(
-      45px,
-      8vw,
-      76px
+      46px,
+      7vw,
+      78px
     );
 
-  line-height: 1;
+  line-height: .98;
 
-  letter-spacing: -3px;
+  letter-spacing: -4px;
 }
 
 .gradient {
@@ -778,28 +873,26 @@ button {
 }
 
 .hero p {
-  max-width: 600px;
+  max-width: 650px;
 
-  color: #aab5ca;
+  color: #9eabc0;
 
-  font-size: 20px;
+  font-size: 19px;
 
   line-height: 1.6;
 }
 
-.primary,
-.secondary {
-  padding: 15px 22px;
-
-  border-radius: 13px;
-
-  font-weight: 800;
-}
-
 .primary {
+  padding:
+    14px 20px;
+
   border: 0;
 
+  border-radius: 12px;
+
   color: white;
+
+  font-weight: 800;
 
   background:
     linear-gradient(
@@ -809,29 +902,19 @@ button {
     );
 }
 
-.secondary {
-  background: transparent;
-
-  color: white;
-
-  border:
-    1px solid #34415d;
-}
-
-
 /* APP */
 
-.chat-app {
-  margin-bottom: 70px;
+.app {
+  margin-bottom: 60px;
+
+  overflow: hidden;
 
   border:
     1px solid #25304a;
 
+  border-radius: 20px;
+
   background: #080f20;
-
-  border-radius: 22px;
-
-  overflow: hidden;
 }
 
 .tabs {
@@ -839,7 +922,7 @@ button {
 
   gap: 10px;
 
-  padding: 15px;
+  padding: 14px;
 
   border-bottom:
     1px solid #202b42;
@@ -848,23 +931,21 @@ button {
 .tab {
   flex: 1;
 
-  padding: 14px;
+  padding: 13px;
+
+  border:
+    1px solid #27334d;
 
   border-radius: 12px;
 
-  background: transparent;
+  background: #0c1426;
 
   color: #aeb9ce;
-
-  border:
-    1px solid #26324b;
 
   font-weight: 800;
 }
 
 .tab.active {
-  color: white;
-
   border-color: transparent;
 
   background:
@@ -873,14 +954,18 @@ button {
       #a855f7,
       #6366f1
     );
+
+  color: white;
 }
 
-.layout {
+.grid {
   display: grid;
 
   grid-template-columns:
-    270px 1fr;
+    280px 1fr;
 }
+
+/* SIDEBAR */
 
 .sidebar {
   padding: 20px;
@@ -890,55 +975,55 @@ button {
 }
 
 .preference {
-  margin: 20px 0;
+  margin: 18px 0;
 }
 
-.preference-title {
-  color: #aab5ca;
-
+.label {
   margin-bottom: 8px;
+
+  color: #aab5ca;
 }
 
-.preference-buttons {
+.choice {
   display: flex;
 }
 
-.preference-buttons button {
-  width: 50%;
+.choice button {
+  flex: 1;
 
   padding: 10px;
+
+  border:
+    1px solid #27334d;
 
   background: #111a2d;
 
   color: white;
-
-  border:
-    1px solid #27334d;
 }
 
-.preference-buttons button.selected {
+.choice button.selected {
   background: #7c3aed;
 }
 
-.select-box {
+.select {
   width: 100%;
 
   padding: 12px;
+
+  border:
+    1px solid #27334d;
 
   border-radius: 10px;
 
   background: #111a2d;
 
   color: white;
-
-  border:
-    1px solid #27334d;
 }
 
-.save-btn {
+.save {
   width: 100%;
 
-  padding: 13px;
+  padding: 12px;
 
   border: 0;
 
@@ -956,25 +1041,34 @@ button {
     );
 }
 
+.hint {
+  margin-top: 22px;
 
-/* CHAT */
+  color: #94a3b8;
 
-.chat-panel {
-  min-height: 620px;
+  line-height: 1.7;
+}
+
+/* CHAT PANEL */
+
+.panel {
+  min-height: 650px;
 
   display: flex;
 
   flex-direction: column;
 }
 
-.chat-header {
-  padding: 20px;
+.header {
+  padding: 18px 20px;
 
   display: flex;
 
+  justify-content: space-between;
+
   align-items: center;
 
-  justify-content: space-between;
+  gap: 12px;
 
   border-bottom:
     1px solid #202b42;
@@ -990,49 +1084,50 @@ button {
   color: #4ade80;
 }
 
-.report-btn {
-  padding: 9px 14px;
-
-  border-radius: 20px;
+.report {
+  padding:
+    9px 14px;
 
   border:
     1px solid #6b2737;
+
+  border-radius: 20px;
 
   background: transparent;
 
   color: #fb7185;
 }
 
-
 /* VIDEO */
 
-.video-area {
+.video {
   display: none;
 
-  padding: 18px;
+  padding: 16px;
 }
 
-.video-area.show {
+.video.show {
   display: block;
 }
 
 .video-box {
   position: relative;
 
-  height: 470px;
+  height: 450px;
 
   overflow: hidden;
 
-  border-radius: 18px;
-
-  background: #020617;
-
   border:
     1px solid #27334d;
+
+  border-radius: 16px;
+
+  background: #020617;
 }
 
 #remoteVideo {
   width: 100%;
+
   height: 100%;
 
   object-fit: cover;
@@ -1041,23 +1136,25 @@ button {
 #localVideo {
   position: absolute;
 
-  right: 15px;
-  bottom: 15px;
+  right: 14px;
 
-  width: 150px;
+  bottom: 14px;
+
+  width: 145px;
+
   height: 115px;
 
   object-fit: cover;
 
-  border-radius: 14px;
-
   border:
     2px solid #7c3aed;
 
-  background: #020617;
+  border-radius: 13px;
+
+  background: #000;
 }
 
-.video-placeholder {
+.placeholder {
   position: absolute;
 
   inset: 0;
@@ -1076,53 +1173,55 @@ button {
 
   gap: 10px;
 
-  padding: 12px 18px;
+  padding: 12px 0;
 }
 
 .video-controls.show {
   display: flex;
 }
 
-.control-btn {
+.control {
   flex: 1;
 
-  padding: 12px;
-
-  border-radius: 10px;
+  padding: 11px;
 
   border:
     1px solid #27334d;
+
+  border-radius: 12px;
 
   background: #111a2d;
 
   color: white;
 }
 
-
 /* MESSAGES */
 
 .messages {
   flex: 1;
 
-  max-height: 400px;
+  min-height: 230px;
+
+  max-height: 360px;
 
   overflow-y: auto;
 
-  padding: 22px;
+  padding: 20px;
 
   display: flex;
 
   flex-direction: column;
 
-  gap: 12px;
+  gap: 10px;
 }
 
 .message {
-  max-width: 75%;
+  max-width: 78%;
 
-  padding: 12px 16px;
+  padding:
+    11px 15px;
 
-  border-radius: 16px;
+  border-radius: 15px;
 
   line-height: 1.45;
 }
@@ -1144,26 +1243,30 @@ button {
     );
 }
 
-.message-input {
+/* COMPOSER */
+
+.composer {
   display: flex;
 
-  gap: 10px;
+  gap: 9px;
 
   padding:
-    0 20px 18px;
+    0 18px
+    16px;
 }
 
-.message-input input {
+.composer input {
   flex: 1;
 
   min-width: 0;
 
-  padding: 14px 18px;
-
-  border-radius: 25px;
+  padding:
+    13px 17px;
 
   border:
     1px solid #34415d;
+
+  border-radius: 24px;
 
   outline: none;
 
@@ -1172,9 +1275,10 @@ button {
   color: white;
 }
 
-.send-btn {
-  width: 52px;
-  height: 52px;
+.send {
+  width: 50px;
+
+  height: 50px;
 
   border: 0;
 
@@ -1190,39 +1294,41 @@ button {
     );
 }
 
-.chat-actions {
+/* ACTIONS */
+
+.actions {
   display: grid;
 
   grid-template-columns:
     1fr 2fr;
 
-  gap: 12px;
+  gap: 10px;
 
-  padding: 18px;
+  padding: 16px;
 
   border-top:
     1px solid #202b42;
 }
 
-.end-btn,
-.next-btn {
-  padding: 14px;
+.end,
+.next {
+  padding: 13px;
 
   border-radius: 12px;
 
   font-weight: 800;
 }
 
-.end-btn {
-  background: #0b1222;
-
+.end {
   border:
     1px solid #202b42;
+
+  background: #0b1222;
 
   color: #fb7185;
 }
 
-.next-btn {
+.next {
   border: 0;
 
   color: white;
@@ -1235,15 +1341,12 @@ button {
     );
 }
 
-
 /* REPORT MODAL */
 
 .modal {
   position: fixed;
 
   inset: 0;
-
-  z-index: 10000;
 
   display: none;
 
@@ -1253,7 +1356,10 @@ button {
 
   padding: 20px;
 
-  background: rgba(0,0,0,.78);
+  background:
+    rgba(0,0,0,.75);
+
+  z-index: 50;
 }
 
 .modal.show {
@@ -1267,12 +1373,12 @@ button {
       100%
     );
 
-  padding: 25px;
-
-  border-radius: 18px;
+  padding: 22px;
 
   border:
     1px solid #34415d;
+
+  border-radius: 18px;
 
   background: #0b1222;
 }
@@ -1281,14 +1387,15 @@ button {
 .modal-box textarea {
   width: 100%;
 
+  margin:
+    8px 0;
+
   padding: 12px;
-
-  margin-bottom: 12px;
-
-  border-radius: 10px;
 
   border:
     1px solid #34415d;
+
+  border-radius: 10px;
 
   background: #111a2d;
 
@@ -1299,6 +1406,8 @@ button {
   display: flex;
 
   gap: 10px;
+
+  margin-top: 8px;
 }
 
 .modal-buttons button {
@@ -1311,114 +1420,27 @@ button {
   border-radius: 10px;
 }
 
-.cancel-btn {
+.cancel {
   background: #182238;
 
   color: white;
 }
 
-.submit-btn {
+.submit-report {
   background: #dc2626;
 
   color: white;
 }
 
-
-/* AGE GATE */
-
-.age-gate {
-  position: fixed;
-
-  inset: 0;
-
-  z-index: 99999;
-
-  display: flex;
-
-  align-items: center;
-
-  justify-content: center;
-
-  padding: 20px;
-
-  background:
-    rgba(3,7,18,.98);
-}
-
-.age-gate.hidden {
-  display: none;
-}
-
-.age-box {
-  width:
-    min(
-      450px,
-      100%
-    );
-
-  padding: 30px;
-
-  text-align: center;
-
-  border-radius: 22px;
-
-  border:
-    1px solid #34415d;
-
-  background: #0b1222;
-}
-
-.age-icon {
-  font-size: 55px;
-}
-
-.age-box p {
-  color: #aab5ca;
-
-  line-height: 1.6;
-}
-
-.age-enter,
-.age-leave {
-  width: 100%;
-
-  padding: 14px;
-
-  margin-top: 10px;
-
-  border-radius: 11px;
-
-  font-weight: 800;
-}
-
-.age-enter {
-  border: 0;
-
-  color: white;
-
-  background:
-    linear-gradient(
-      90deg,
-      #d946ef,
-      #7c3aed
-    );
-}
-
-.age-leave {
-  border:
-    1px solid #34415d;
-
-  background: #111a2d;
-
-  color: white;
-}
-
-
 /* MOBILE */
 
 @media(max-width:800px) {
 
-  .layout {
+  .links {
+    display: none;
+  }
+
+  .grid {
     grid-template-columns: 1fr;
   }
 
@@ -1429,7 +1451,7 @@ button {
       1px solid #202b42;
   }
 
-  .chat-actions {
+  .actions {
     grid-template-columns: 1fr;
   }
 
@@ -1439,179 +1461,152 @@ button {
 
   #localVideo {
     width: 115px;
-    height: 150px;
+
+    height: 145px;
   }
 
   .message {
-    max-width: 85%;
+    max-width: 88%;
   }
+
 }
 
 </style>
 
 </head>
 
-
 <body>
 
+<header class="nav">
 
-<!-- =====================================================
-     18+ GATE
-===================================================== -->
+<div class="wrap nav-inner">
 
-<div
-  id="ageGate"
-  class="age-gate"
->
-
-  <div class="age-box">
-
-    <div class="age-icon">
-      🔞
-    </div>
-
-    <h2>
-      RandomTalk is 18+
-    </h2>
-
-    <p>
-      RandomTalk connects you with strangers.
-      Never share your address, phone number,
-      passwords, financial information, or other
-      private information.
-    </p>
-
-    <button
-      class="age-enter"
-      onclick="enterSite()"
-    >
-      I am 18 or older — Enter
-    </button>
-
-    <button
-      class="age-leave"
-      onclick="leaveSite()"
-    >
-      Leave
-    </button>
-
-  </div>
-
+<div class="logo">
+💬 Random<b>Talk</b>
 </div>
 
+<nav class="links">
 
-<!-- =====================================================
-     NAV
-===================================================== -->
+<a href="#top">
+Home
+</a>
 
-<header class="navbar">
+<a href="#chat">
+Chat
+</a>
 
-  <div class="nav-inner">
+<a href="#safety">
+Safety
+</a>
 
-    <div class="logo">
-      💬 Random<span>Talk</span>
-    </div>
+</nav>
 
-  </div>
+</div>
 
 </header>
 
 
-<main>
+<main
+  id="top"
+  class="wrap"
+>
 
+<section class="hero">
 
-<!-- HERO -->
+<h1>
 
-<section class="hero container">
+Talk to<br>
 
-  <h1>
-    Talk to someone
-    <span class="gradient">
-      new.
-    </span>
-  </h1>
+someone
+<span class="gradient">
+new.
+</span>
 
-  <p>
-    Meet random people through
-    text or video chat.
-  </p>
+</h1>
 
-  <button
-    class="primary"
-    onclick="startFromHero()"
-  >
-    🚀 Start Chatting
-  </button>
+<p>
+
+Meet random people through
+text or video chat.
+Choose your matching
+preferences and connect
+with an available stranger.
+
+</p>
+
+<button
+class="primary"
+onclick="startHero()"
+>
+
+🚀 Start Chatting
+
+</button>
 
 </section>
 
 
-<!-- CHAT APP -->
-
 <section
-  id="chat"
-  class="container"
+id="chat"
+class="app"
 >
-
-<div class="chat-app">
-
-
-<!-- TABS -->
 
 <div class="tabs">
 
 <button
-  id="textTab"
-  class="tab active"
-  onclick="selectText()"
+id="textTab"
+class="tab active"
+onclick="setMode('text')"
 >
-  💬 Text Chat
+
+💬 Text Chat
+
 </button>
 
 <button
-  id="videoTab"
-  class="tab"
-  onclick="selectVideo()"
+id="videoTab"
+class="tab"
+onclick="setMode('video')"
 >
-  🎥 Video Chat
+
+🎥 Video Chat
+
 </button>
 
 </div>
 
 
-<div class="layout">
+<div class="grid">
 
-
-<!-- SIDEBAR -->
 
 <aside class="sidebar">
 
 <h3>
-  ⚙️ Preferences
+⚙️ Preferences
 </h3>
 
 
 <div class="preference">
 
-<div class="preference-title">
-  Chat with
+<div class="label">
+Chat with
 </div>
 
-<div class="preference-buttons">
+<div class="choice">
 
 <button
-  id="everyoneBtn"
-  class="selected"
-  onclick="chooseEveryone()"
+id="everyoneBtn"
+class="selected"
+onclick="setChatWith('everyone')"
 >
-  Everyone
+Everyone
 </button>
 
 <button
-  id="genderBtn"
-  onclick="chooseGender()"
+id="genderBtn"
+onclick="setChatWith('gender')"
 >
-  Gender
+Gender
 </button>
 
 </div>
@@ -1620,31 +1615,31 @@ button {
 
 
 <div
-  id="genderSettings"
-  style="display:none"
+id="genderPrefs"
+style="display:none"
 >
 
 <div class="preference">
 
-<div class="preference-title">
-  My gender
+<div class="label">
+My gender
 </div>
 
 <select
-  id="myGender"
-  class="select-box"
+id="myGender"
+class="select"
 >
 
 <option value="male">
-  Male
+Male
 </option>
 
 <option value="female">
-  Female
+Female
 </option>
 
 <option value="other">
-  Other
+Other
 </option>
 
 </select>
@@ -1654,29 +1649,29 @@ button {
 
 <div class="preference">
 
-<div class="preference-title">
-  Preferred gender
+<div class="label">
+I want to chat with
 </div>
 
 <select
-  id="preferredGender"
-  class="select-box"
+id="preferredGender"
+class="select"
 >
 
 <option value="any">
-  Any gender
+Any gender
 </option>
 
 <option value="male">
-  Male
+Male
 </option>
 
 <option value="female">
-  Female
+Female
 </option>
 
 <option value="other">
-  Other
+Other
 </option>
 
 </select>
@@ -1688,33 +1683,41 @@ button {
 
 <div class="preference">
 
-<div class="preference-title">
-  Country
+<div class="label">
+Country
 </div>
 
 <select
-  id="country"
-  class="select-box"
+id="country"
+class="select"
 >
 
 <option value="any">
-  Any country
+Any country
 </option>
 
 <option value="india">
-  India 🇮🇳
+India 🇮🇳
 </option>
 
 <option value="usa">
-  United States 🇺🇸
+United States 🇺🇸
 </option>
 
 <option value="uk">
-  United Kingdom 🇬🇧
+United Kingdom 🇬🇧
 </option>
 
 <option value="canada">
-  Canada 🇨🇦
+Canada 🇨🇦
+</option>
+
+<option value="australia">
+Australia 🇦🇺
+</option>
+
+<option value="other">
+Other
 </option>
 
 </select>
@@ -1723,59 +1726,77 @@ button {
 
 
 <button
-  class="save-btn"
-  onclick="savePreferences()"
+class="save"
+onclick="savePrefs()"
 >
-  ✨ Save Preferences
+
+✨ Save Preferences
+
 </button>
 
 
-<p
-  style="
-    color:#94a3b8;
-    line-height:1.7;
-  "
+<div
+id="safety"
+class="hint"
 >
-  <b>Safety</b><br>
-  • Be respectful<br>
-  • Don't share personal information<br>
-  • Report inappropriate users<br>
-  • Leave anytime
-</p>
+
+<b>
+Safety
+</b>
+
+<br>
+
+• Be respectful
+<br>
+
+• Don't share personal information
+<br>
+
+• Report inappropriate users
+<br>
+
+• Leave anytime
+
+</div>
 
 </aside>
 
 
-<!-- CHAT PANEL -->
-
-<section class="chat-panel">
+<section class="panel">
 
 
-<div class="chat-header">
+<div class="header">
 
 <div>
 
 <div
-  id="connectionStatus"
-  class="status"
+id="status"
+class="status"
 >
-  ● Ready
+
+● Ready
+
 </div>
 
 <small
-  id="connectionText"
+id="statusText"
 >
-  Press Start Chatting.
+
+Choose Text or Video
+and press Start Chatting.
+
 </small>
 
 </div>
 
 
 <button
-  class="report-btn"
-  onclick="openReport()"
+class="report"
+onclick="openReport()"
 >
-  ⚠ Report
+
+⚠ Report
+
 </button>
 
 </div>
@@ -1784,41 +1805,44 @@ button {
 <!-- VIDEO -->
 
 <div
-  id="videoArea"
-  class="video-area"
+id="videoArea"
+class="video"
 >
 
 <div class="video-box">
 
 <video
-  id="remoteVideo"
-  autoplay
-  playsinline
+id="remoteVideo"
+autoplay
+playsinline
 ></video>
 
 <video
-  id="localVideo"
-  autoplay
-  muted
-  playsinline
+id="localVideo"
+autoplay
+muted
+playsinline
 ></video>
 
+
 <div
-  id="videoPlaceholder"
-  class="video-placeholder"
+id="videoPlaceholder"
+class="placeholder"
 >
 
 <div>
 
-<div style="font-size:55px">
-  🎥
+<div
+style="font-size:55px"
+>
+🎥
 </div>
 
 <div
-  id="videoPlaceholderText"
+id="videoPlaceholderText"
 >
-  Waiting for video...
-</div>
+
+Waiting for video...
 
 </div>
 
@@ -1828,27 +1852,33 @@ button {
 
 </div>
 
-
-<!-- VIDEO CONTROLS -->
 
 <div
-  id="videoControls"
-  class="video-controls"
+id="videoControls"
+class="video-controls"
 >
 
 <button
-  class="control-btn"
-  onclick="toggleCamera()"
+id="cameraButton"
+class="control"
+onclick="toggleCamera()"
 >
-  📷 Camera On
+
+📷 Camera On
+
 </button>
 
 <button
-  class="control-btn"
-  onclick="toggleMicrophone()"
+id="microphoneButton"
+class="control"
+onclick="toggleMicrophone()"
 >
-  🎤 Microphone On
+
+🎤 Microphone On
+
 </button>
+
+</div>
 
 </div>
 
@@ -1856,38 +1886,43 @@ button {
 <!-- MESSAGES -->
 
 <div
-  id="messages"
-  class="messages"
+id="messages"
+class="messages"
 >
 
 <div class="message received">
-  👋 Welcome to RandomTalk!
+
+👋 Welcome to RandomTalk!
+
 </div>
 
 <div class="message received">
-  Choose Text or Video and press Start Chatting.
-</div>
+
+Press Start Chatting to find someone.
 
 </div>
 
+</div>
 
-<!-- INPUT -->
 
-<div class="message-input">
+<!-- COMPOSER -->
+
+<div class="composer">
 
 <input
-  id="messageInput"
-  type="text"
-  placeholder="Start a chat first..."
-  disabled
-  onkeydown="handleEnter(event)"
+id="messageInput"
+disabled
+placeholder="Start a chat first..."
+onkeydown="handleEnter(event)"
 >
 
 <button
-  class="send-btn"
-  onclick="sendMessage()"
+class="send"
+onclick="sendMessage()"
 >
-  ➤
+
+➤
+
 </button>
 
 </div>
@@ -1895,29 +1930,31 @@ button {
 
 <!-- ACTIONS -->
 
-<div class="chat-actions">
+<div class="actions">
 
 <button
-  class="end-btn"
-  onclick="endChat()"
+class="end"
+onclick="endChat()"
 >
-  ⏹ End Chat
+
+⏹ End Chat
+
 </button>
 
 <button
-  id="startNextButton"
-  class="next-btn"
-  onclick="startOrNext()"
+id="nextButton"
+class="next"
+onclick="startOrNext()"
 >
-  🚀 Start Chatting
+
+🚀 Start Chatting
+
 </button>
 
 </div>
 
 
 </section>
-
-</div>
 
 </div>
 
@@ -1926,84 +1963,88 @@ button {
 </main>
 
 
-<!-- =====================================================
-     REPORT MODAL
-===================================================== -->
+<!-- REPORT MODAL -->
 
 <div
-  id="reportModal"
-  class="modal"
+id="reportModal"
+class="modal"
 >
 
 <div class="modal-box">
 
 <h2>
-  ⚠ Report User
+⚠ Report User
 </h2>
 
 <p
-  style="color:#94a3b8"
+style="color:#94a3b8"
 >
-  Tell us what happened.
+
+Tell us what happened.
+
 </p>
 
 
 <select
-  id="reportReason"
+id="reportReason"
 >
 
 <option value="Harassment">
-  Harassment
+Harassment
 </option>
 
 <option value="Sexual content">
-  Sexual content
+Sexual content
 </option>
 
 <option value="Hate or abuse">
-  Hate or abuse
+Hate or abuse
 </option>
 
 <option value="Spam">
-  Spam
+Spam
 </option>
 
 <option value="Scam">
-  Scam
+Scam
 </option>
 
 <option value="Inappropriate behavior">
-  Inappropriate behavior
+Inappropriate behavior
 </option>
 
 <option value="Other">
-  Other
+Other
 </option>
 
 </select>
 
 
 <textarea
-  id="reportDetails"
-  rows="4"
-  placeholder="Optional details..."
+id="reportDetails"
+rows="4"
+placeholder="Optional details..."
 ></textarea>
 
 
 <div class="modal-buttons">
 
 <button
-  class="cancel-btn"
-  onclick="closeReport()"
+class="cancel"
+onclick="closeReport()"
 >
-  Cancel
+
+Cancel
+
 </button>
 
 <button
-  class="submit-btn"
-  onclick="submitReport()"
+class="submit-report"
+onclick="submitReport()"
 >
-  Submit Report
+
+Submit Report
+
 </button>
 
 </div>
@@ -2041,77 +2082,6 @@ let pendingIceCandidates = [];
 
 
 /* =========================================================
-   ELEMENTS
-========================================================= */
-
-const textTab =
-  document.getElementById("textTab");
-
-const videoTab =
-  document.getElementById("videoTab");
-
-const videoArea =
-  document.getElementById("videoArea");
-
-const videoControls =
-  document.getElementById("videoControls");
-
-const remoteVideo =
-  document.getElementById("remoteVideo");
-
-const localVideo =
-  document.getElementById("localVideo");
-
-const videoPlaceholder =
-  document.getElementById("videoPlaceholder");
-
-const videoPlaceholderText =
-  document.getElementById(
-    "videoPlaceholderText"
-  );
-
-const messages =
-  document.getElementById("messages");
-
-const messageInput =
-  document.getElementById("messageInput");
-
-const connectionStatus =
-  document.getElementById(
-    "connectionStatus"
-  );
-
-const connectionText =
-  document.getElementById(
-    "connectionText"
-  );
-
-const startNextButton =
-  document.getElementById(
-    "startNextButton"
-  );
-
-const ageGate =
-  document.getElementById("ageGate");
-
-const genderSettings =
-  document.getElementById(
-    "genderSettings"
-  );
-
-const countrySelect =
-  document.getElementById("country");
-
-const myGenderSelect =
-  document.getElementById("myGender");
-
-const preferredGenderSelect =
-  document.getElementById(
-    "preferredGender"
-  );
-
-
-/* =========================================================
    WEBRTC
 ========================================================= */
 
@@ -2135,53 +2105,12 @@ const rtcConfig = {
 
 
 /* =========================================================
-   AGE GATE
+   HELPER
 ========================================================= */
 
-function enterSite() {
+function $(id) {
 
-  localStorage.setItem(
-    "randomtalk_age_verified",
-    "yes"
-  );
-
-  ageGate.classList.add("hidden");
-}
-
-
-function leaveSite() {
-
-  document.body.innerHTML = `
-
-<div
-  style="
-    min-height:100vh;
-    display:grid;
-    place-items:center;
-    padding:30px;
-    background:#050816;
-    color:white;
-    text-align:center;
-    font-family:Arial,sans-serif;
-  "
->
-
-<div>
-
-<h1>
-  Thanks for visiting.
-</h1>
-
-<p style="color:#94a3b8">
-  You must be 18 or older
-  to use RandomTalk.
-</p>
-
-</div>
-
-</div>
-
-`;
+  return document.getElementById(id);
 
 }
 
@@ -2190,31 +2119,33 @@ function leaveSite() {
    MODE
 ========================================================= */
 
-function selectText() {
+function setMode(mode) {
 
-  currentMode = "text";
+  currentMode = mode;
 
-  textTab.classList.add("active");
+  $("textTab")
+    .classList.toggle(
+      "active",
+      mode === "text"
+    );
 
-  videoTab.classList.remove("active");
+  $("videoTab")
+    .classList.toggle(
+      "active",
+      mode === "video"
+    );
 
-  videoArea.classList.remove("show");
+  $("videoArea")
+    .classList.toggle(
+      "show",
+      mode === "video"
+    );
 
-  videoControls.classList.remove("show");
-}
-
-
-function selectVideo() {
-
-  currentMode = "video";
-
-  videoTab.classList.add("active");
-
-  textTab.classList.remove("active");
-
-  videoArea.classList.add("show");
-
-  videoControls.classList.add("show");
+  $("videoControls")
+    .classList.toggle(
+      "show",
+      mode === "video"
+    );
 }
 
 
@@ -2222,42 +2153,121 @@ function selectVideo() {
    GENDER
 ========================================================= */
 
-function chooseEveryone() {
+function setChatWith(value) {
 
-  currentChatWith = "everyone";
+  currentChatWith = value;
 
-  document
-    .getElementById("everyoneBtn")
-    .classList.add("selected");
+  $("everyoneBtn")
+    .classList.toggle(
+      "selected",
+      value === "everyone"
+    );
 
-  document
-    .getElementById("genderBtn")
-    .classList.remove("selected");
+  $("genderBtn")
+    .classList.toggle(
+      "selected",
+      value === "gender"
+    );
 
-  genderSettings.style.display =
-    "none";
-}
-
-
-function chooseGender() {
-
-  currentChatWith = "gender";
-
-  document
-    .getElementById("genderBtn")
-    .classList.add("selected");
-
-  document
-    .getElementById("everyoneBtn")
-    .classList.remove("selected");
-
-  genderSettings.style.display =
-    "block";
+  $("genderPrefs").style.display =
+    value === "gender"
+      ? "block"
+      : "none";
 }
 
 
 /* =========================================================
-   SOCKET
+   STATUS
+========================================================= */
+
+function updateStatus(
+  title,
+  text,
+  connectedState
+) {
+
+  $("status").textContent =
+    title;
+
+  $("statusText").textContent =
+    text;
+
+  $("status")
+    .classList.toggle(
+      "connected",
+      connectedState
+    );
+}
+
+
+function setButton(text) {
+
+  $("nextButton").textContent =
+    text;
+}
+
+
+/* =========================================================
+   MESSAGES
+========================================================= */
+
+function addMessage(
+  text,
+  type = "received"
+) {
+
+  const div =
+    document.createElement(
+      "div"
+    );
+
+  div.className =
+    "message " + type;
+
+  div.textContent =
+    text;
+
+  $("messages")
+    .appendChild(div);
+
+  $("messages").scrollTop =
+    $("messages").scrollHeight;
+}
+
+
+function clearMessages() {
+
+  $("messages").innerHTML = "";
+
+}
+
+
+/* =========================================================
+   INPUT
+========================================================= */
+
+function enableInput() {
+
+  $("messageInput").disabled =
+    false;
+
+  $("messageInput").placeholder =
+    "Type a message...";
+}
+
+
+function disableInput() {
+
+  $("messageInput").disabled =
+    true;
+
+  $("messageInput").placeholder =
+    "Waiting for a stranger...";
+}
+
+
+/* =========================================================
+   WEBSOCKET
 ========================================================= */
 
 function connectSocket() {
@@ -2272,6 +2282,7 @@ function connectSocket() {
         WebSocket.CONNECTING
     )
   ) {
+
     return;
   }
 
@@ -2295,11 +2306,22 @@ function connectSocket() {
     "open",
     function() {
 
+      const gender =
+        $("myGender").value;
+
+      const preferredGender =
+        $("preferredGender").value;
+
+      const country =
+        $("country").value;
+
+
       updateStatus(
         "● Searching...",
         "Looking for a compatible stranger...",
         false
       );
+
 
       setButton(
         "⏳ Searching..."
@@ -2311,21 +2333,23 @@ function connectSocket() {
 
           type: "join",
 
-          mode: currentMode,
+          mode:
+            currentMode,
 
           chatWith:
             currentChatWith,
 
           gender:
-            myGenderSelect.value,
+            gender,
 
           preferredGender:
-            currentChatWith === "gender"
-              ? preferredGenderSelect.value
+            currentChatWith ===
+            "gender"
+              ? preferredGender
               : "any",
 
           country:
-            countrySelect.value
+            country
 
         })
       );
@@ -2343,12 +2367,13 @@ function connectSocket() {
       try {
 
         data =
-          JSON.parse(event.data);
+          JSON.parse(
+            event.data
+          );
 
       } catch {
 
         return;
-
       }
 
 
@@ -2360,13 +2385,13 @@ function connectSocket() {
 
         connected = false;
 
+        disableInput();
+
         updateStatus(
           "● Searching...",
-          "Waiting for another compatible person...",
+          "Waiting for a compatible stranger...",
           false
         );
-
-        disableInput();
 
         setButton(
           "⏳ Searching..."
@@ -2393,6 +2418,13 @@ function connectSocket() {
             : "text";
 
 
+        enableInput();
+
+        setButton(
+          "⏭ Next"
+        );
+
+
         updateStatus(
           "● Connected",
           currentMode === "video"
@@ -2402,14 +2434,7 @@ function connectSocket() {
         );
 
 
-        enableInput();
-
-        setButton(
-          "⏭ Next"
-        );
-
-
-        addSystemMessage(
+        addMessage(
           "🎉 Connected! Say hello."
         );
 
@@ -2418,15 +2443,13 @@ function connectSocket() {
           currentMode === "video"
         ) {
 
-          selectVideo();
-
+          setMode("video");
 
           try {
 
             await startLocalMedia();
 
             await createPeerConnection();
-
 
             if (isInitiator) {
 
@@ -2437,13 +2460,12 @@ function connectSocket() {
           } catch (error) {
 
             console.error(
-              "Camera/microphone error:",
+              "Camera error:",
               error
             );
 
-
-            addSystemMessage(
-              "⚠️ Camera/microphone permission failed. Check your browser permissions."
+            addMessage(
+              "⚠️ Camera/microphone permission was not granted."
             );
 
           }
@@ -2460,8 +2482,9 @@ function connectSocket() {
         data.type === "chat"
       ) {
 
-        addReceivedMessage(
-          data.text
+        addMessage(
+          data.text,
+          "received"
         );
 
         return;
@@ -2483,7 +2506,7 @@ function connectSocket() {
         } catch (error) {
 
           console.error(
-            "WebRTC signal error:",
+            "Signal error:",
             error
           );
 
@@ -2496,7 +2519,8 @@ function connectSocket() {
       /* PARTNER LEFT */
 
       if (
-        data.type === "partner_left"
+        data.type ===
+        "partner_left"
       ) {
 
         connected = false;
@@ -2505,19 +2529,17 @@ function connectSocket() {
 
         disableInput();
 
-        setButton(
-          "⏳ Searching..."
-        );
-
-
         updateStatus(
           "● Stranger left",
           "Searching for another compatible person...",
           false
         );
 
+        setButton(
+          "⏳ Searching..."
+        );
 
-        addSystemMessage(
+        addMessage(
           "👋 Stranger left. Searching..."
         );
 
@@ -2528,7 +2550,8 @@ function connectSocket() {
       /* REPORT */
 
       if (
-        data.type === "report_success"
+        data.type ===
+        "report_success"
       ) {
 
         closeReport();
@@ -2554,15 +2577,14 @@ function connectSocket() {
 
       disableInput();
 
-      setButton(
-        "🚀 Start Chatting"
-      );
-
-
       updateStatus(
         "● Disconnected",
         "Press Start Chatting.",
         false
+      );
+
+      setButton(
+        "🚀 Start Chatting"
       );
 
     }
@@ -2586,13 +2608,15 @@ function connectSocket() {
 
 
 /* =========================================================
-   CAMERA + MICROPHONE
+   CAMERA
 ========================================================= */
 
 async function startLocalMedia() {
 
   if (localStream) {
+
     return localStream;
+
   }
 
 
@@ -2609,33 +2633,35 @@ async function startLocalMedia() {
 
 
   localStream =
-    await navigator.mediaDevices.getUserMedia({
+    await navigator.mediaDevices
+      .getUserMedia({
 
-      video: {
-        facingMode: "user"
-      },
+        video: {
+          facingMode: "user"
+        },
 
-      audio: true
+        audio: true
 
-    });
+      });
 
 
-  localVideo.srcObject =
+  $("localVideo").srcObject =
     localStream;
 
+  $("localVideo").muted =
+    true;
 
-  localVideo.muted = true;
 
-
-  await localVideo
+  await $("localVideo")
     .play()
-    .catch(function(){});
+    .catch(
+      function() {}
+    );
 
 
   cameraEnabled = true;
 
   microphoneEnabled = true;
-
 
   updateVideoButtons();
 
@@ -2651,7 +2677,9 @@ async function startLocalMedia() {
 async function createPeerConnection() {
 
   if (peerConnection) {
+
     return peerConnection;
+
   }
 
 
@@ -2687,20 +2715,25 @@ async function createPeerConnection() {
         !event.streams ||
         !event.streams[0]
       ) {
+
         return;
+
       }
 
 
-      remoteVideo.srcObject =
+      $("remoteVideo").srcObject =
         event.streams[0];
 
 
-      remoteVideo
+      $("remoteVideo")
         .play()
-        .catch(function(){});
+        .catch(
+          function() {}
+        );
 
 
-      videoPlaceholder.style.display =
+      $("videoPlaceholder")
+        .style.display =
         "none";
 
 
@@ -2724,7 +2757,9 @@ async function createPeerConnection() {
         socket.readyState !==
           WebSocket.OPEN
       ) {
+
         return;
+
       }
 
 
@@ -2754,16 +2789,29 @@ async function createPeerConnection() {
     function() {
 
       if (!peerConnection) {
+
         return;
+
       }
 
 
+      const state =
+        peerConnection
+          .connectionState;
+
+
+      console.log(
+        "WebRTC:",
+        state
+      );
+
+
       if (
-        peerConnection.connectionState ===
-        "connected"
+        state === "connected"
       ) {
 
-        videoPlaceholder.style.display =
+        $("videoPlaceholder")
+          .style.display =
           "none";
 
 
@@ -2777,15 +2825,16 @@ async function createPeerConnection() {
 
 
       if (
-        peerConnection.connectionState ===
-        "failed"
+        state === "failed"
       ) {
 
-        videoPlaceholder.style.display =
+        $("videoPlaceholder")
+          .style.display =
           "grid";
 
 
-        videoPlaceholderText.textContent =
+        $("videoPlaceholderText")
+          .textContent =
           "Video connection failed. Try Next.";
 
       }
@@ -2805,17 +2854,21 @@ async function createPeerConnection() {
 async function createOffer() {
 
   if (!peerConnection) {
+
     return;
+
   }
 
 
   const offer =
-    await peerConnection.createOffer();
+    await peerConnection
+      .createOffer();
 
 
-  await peerConnection.setLocalDescription(
-    offer
-  );
+  await peerConnection
+    .setLocalDescription(
+      offer
+    );
 
 
   if (
@@ -2841,7 +2894,6 @@ async function createOffer() {
     );
 
   }
-
 }
 
 
@@ -2849,10 +2901,14 @@ async function createOffer() {
    SIGNAL
 ========================================================= */
 
-async function handleSignal(signal) {
+async function handleSignal(
+  signal
+) {
 
   if (!signal) {
+
     return;
+
   }
 
 
@@ -2866,7 +2922,8 @@ async function handleSignal(signal) {
 
 
   if (
-    signal.type === "offer"
+    signal.type ===
+    "offer"
   ) {
 
     await peerConnection
@@ -2913,7 +2970,8 @@ async function handleSignal(signal) {
 
 
   if (
-    signal.type === "answer"
+    signal.type ===
+    "answer"
   ) {
 
     await peerConnection
@@ -2926,13 +2984,13 @@ async function handleSignal(signal) {
 
     await flushPendingIce();
 
-
     return;
   }
 
 
   if (
-    signal.type === "ice" &&
+    signal.type ===
+      "ice" &&
     signal.candidate
   ) {
 
@@ -2972,13 +3030,15 @@ async function handleSignal(signal) {
 
 
 /* =========================================================
-   ICE
+   ICE QUEUE
 ========================================================= */
 
 async function flushPendingIce() {
 
   if (!peerConnection) {
+
     return;
+
   }
 
 
@@ -3005,7 +3065,7 @@ async function flushPendingIce() {
     } catch (error) {
 
       console.error(
-        "Queued ICE error:",
+        "ICE queue error:",
         error
       );
 
@@ -3038,37 +3098,44 @@ function closePeerConnection() {
   }
 
 
-  remoteVideo.srcObject =
+  $("remoteVideo").srcObject =
     null;
 
 
-  videoPlaceholder.style.display =
+  $("videoPlaceholder")
+    .style.display =
     "grid";
 
 
-  videoPlaceholderText.textContent =
+  $("videoPlaceholderText")
+    .textContent =
     "Waiting for video...";
 
 }
 
 
 /* =========================================================
-   CAMERA
+   CAMERA CONTROLS
 ========================================================= */
 
 function toggleCamera() {
 
   if (!localStream) {
+
     return;
+
   }
 
 
   const tracks =
-    localStream.getVideoTracks();
+    localStream
+      .getVideoTracks();
 
 
   if (!tracks.length) {
+
     return;
+
   }
 
 
@@ -3091,23 +3158,24 @@ function toggleCamera() {
 }
 
 
-/* =========================================================
-   MICROPHONE
-========================================================= */
-
 function toggleMicrophone() {
 
   if (!localStream) {
+
     return;
+
   }
 
 
   const tracks =
-    localStream.getAudioTracks();
+    localStream
+      .getAudioTracks();
 
 
   if (!tracks.length) {
+
     return;
+
   }
 
 
@@ -3130,44 +3198,31 @@ function toggleMicrophone() {
 }
 
 
-/* =========================================================
-   VIDEO BUTTONS
-========================================================= */
-
 function updateVideoButtons() {
 
-  const buttons =
-    document.querySelectorAll(
-      ".control-btn"
-    );
+  $("cameraButton")
+    .textContent =
+    cameraEnabled
+      ? "📷 Camera On"
+      : "📷 Camera Off";
 
 
-  if (buttons.length >= 2) {
-
-    buttons[0].textContent =
-      cameraEnabled
-        ? "📷 Camera On"
-        : "📷 Camera Off";
-
-
-    buttons[1].textContent =
-      microphoneEnabled
-        ? "🎤 Microphone On"
-        : "🔇 Microphone Off";
-
-  }
+  $("microphoneButton")
+    .textContent =
+    microphoneEnabled
+      ? "🎤 Microphone On"
+      : "🔇 Microphone Off";
 
 }
 
 
 /* =========================================================
-   START
+   START / NEXT
 ========================================================= */
 
-function startFromHero() {
+function startHero() {
 
-  document
-    .getElementById("chat")
+  $("chat")
     .scrollIntoView({
       behavior: "smooth"
     });
@@ -3208,15 +3263,14 @@ function startOrNext() {
 
     connected = false;
 
+    disableInput();
+
 
     updateStatus(
       "● Searching...",
       "Finding another compatible person...",
       false
     );
-
-
-    disableInput();
 
 
     setButton(
@@ -3247,8 +3301,12 @@ function startOrNext() {
 
 function sendMessage() {
 
+  const input =
+    $("messageInput");
+
+
   const text =
-    messageInput.value.trim();
+    input.value.trim();
 
 
   if (
@@ -3275,11 +3333,13 @@ function sendMessage() {
   );
 
 
-  addSentMessage(text);
+  addMessage(
+    text,
+    "sent"
+  );
 
 
-  messageInput.value =
-    "";
+  input.value = "";
 
 }
 
@@ -3287,7 +3347,8 @@ function sendMessage() {
 function handleEnter(event) {
 
   if (
-    event.key === "Enter"
+    event.key ===
+    "Enter"
   ) {
 
     event.preventDefault();
@@ -3300,7 +3361,7 @@ function handleEnter(event) {
 
 
 /* =========================================================
-   END
+   END CHAT
 ========================================================= */
 
 function endChat() {
@@ -3325,9 +3386,7 @@ function endChat() {
 
   connected = false;
 
-
   closePeerConnection();
-
 
   disableInput();
 
@@ -3344,7 +3403,7 @@ function endChat() {
   );
 
 
-  addSystemMessage(
+  addMessage(
     "Chat ended."
   );
 
@@ -3368,18 +3427,20 @@ function openReport() {
   }
 
 
-  document
-    .getElementById("reportModal")
-    .classList.add("show");
+  $("reportModal")
+    .classList.add(
+      "show"
+    );
 
 }
 
 
 function closeReport() {
 
-  document
-    .getElementById("reportModal")
-    .classList.remove("show");
+  $("reportModal")
+    .classList.remove(
+      "show"
+    );
 
 }
 
@@ -3403,19 +3464,11 @@ function submitReport() {
 
 
   const reason =
-    document
-      .getElementById(
-        "reportReason"
-      )
-      .value;
+    $("reportReason").value;
 
 
   const details =
-    document
-      .getElementById(
-        "reportDetails"
-      )
-      .value;
+    $("reportDetails").value;
 
 
   socket.send(
@@ -3437,184 +3490,29 @@ function submitReport() {
    PREFERENCES
 ========================================================= */
 
-function savePreferences() {
+function savePrefs() {
 
   localStorage.setItem(
     "randomtalk_country",
-    countrySelect.value
+    $("country").value
   );
 
 
   localStorage.setItem(
     "randomtalk_gender",
-    myGenderSelect.value
+    $("myGender").value
   );
 
 
   localStorage.setItem(
     "randomtalk_preferred_gender",
-    preferredGenderSelect.value
+    $("preferredGender").value
   );
 
 
   alert(
     "✅ Preferences saved."
   );
-
-}
-
-
-/* =========================================================
-   UI
-========================================================= */
-
-function updateStatus(
-  title,
-  text,
-  isConnected
-) {
-
-  connectionStatus.textContent =
-    title;
-
-
-  connectionText.textContent =
-    text;
-
-
-  if (isConnected) {
-
-    connectionStatus.classList.add(
-      "connected"
-    );
-
-  } else {
-
-    connectionStatus.classList.remove(
-      "connected"
-    );
-
-  }
-
-}
-
-
-function setButton(text) {
-
-  startNextButton.textContent =
-    text;
-
-}
-
-
-function enableInput() {
-
-  messageInput.disabled =
-    false;
-
-
-  messageInput.placeholder =
-    "Type a message...";
-
-}
-
-
-function disableInput() {
-
-  messageInput.disabled =
-    true;
-
-
-  messageInput.placeholder =
-    "Waiting for a stranger...";
-
-}
-
-
-function clearMessages() {
-
-  messages.innerHTML =
-    "";
-
-}
-
-
-function addSystemMessage(text) {
-
-  const div =
-    document.createElement(
-      "div"
-    );
-
-
-  div.className =
-    "message received";
-
-
-  div.textContent =
-    text;
-
-
-  messages.appendChild(div);
-
-
-  scrollMessages();
-
-}
-
-
-function addReceivedMessage(text) {
-
-  const div =
-    document.createElement(
-      "div"
-    );
-
-
-  div.className =
-    "message received";
-
-
-  div.textContent =
-    text;
-
-
-  messages.appendChild(div);
-
-
-  scrollMessages();
-
-}
-
-
-function addSentMessage(text) {
-
-  const div =
-    document.createElement(
-      "div"
-    );
-
-
-  div.className =
-    "message sent";
-
-
-  div.textContent =
-    text;
-
-
-  messages.appendChild(div);
-
-
-  scrollMessages();
-
-}
-
-
-function scrollMessages() {
-
-  messages.scrollTop =
-    messages.scrollHeight;
 
 }
 
@@ -3627,68 +3525,47 @@ window.addEventListener(
   "load",
   function() {
 
-    selectText();
+    setMode("text");
 
 
-    /* AGE */
-
-    if (
-      localStorage.getItem(
-        "randomtalk_age_verified"
-      ) === "yes"
-    ) {
-
-      ageGate.classList.add(
-        "hidden"
-      );
-
-    }
-
-
-    /* COUNTRY */
-
-    const savedCountry =
+    const country =
       localStorage.getItem(
         "randomtalk_country"
       );
 
 
-    if (savedCountry) {
-
-      countrySelect.value =
-        savedCountry;
-
-    }
-
-
-    /* GENDER */
-
-    const savedGender =
+    const gender =
       localStorage.getItem(
         "randomtalk_gender"
       );
 
 
-    if (savedGender) {
-
-      myGenderSelect.value =
-        savedGender;
-
-    }
-
-
-    /* PREFERRED GENDER */
-
-    const savedPreferred =
+    const preferred =
       localStorage.getItem(
         "randomtalk_preferred_gender"
       );
 
 
-    if (savedPreferred) {
+    if (country) {
 
-      preferredGenderSelect.value =
-        savedPreferred;
+      $("country").value =
+        country;
+
+    }
+
+
+    if (gender) {
+
+      $("myGender").value =
+        gender;
+
+    }
+
+
+    if (preferred) {
+
+      $("preferredGender").value =
+        preferred;
 
     }
 
@@ -3700,104 +3577,3 @@ window.addEventListener(
 </body>
 
 </html>`;
-
-
-/* =========================================================
-   MAIN WORKER
-========================================================= */
-
-export default {
-
-  async fetch(request, env) {
-
-    const url =
-      new URL(request.url);
-
-
-    /* WEBSOCKET */
-
-    if (
-      url.pathname === "/ws"
-    ) {
-
-      if (
-        request.headers
-          .get("Upgrade")
-          ?.toLowerCase() !==
-        "websocket"
-      ) {
-
-        return new Response(
-          "WebSocket upgrade required.",
-          {
-            status: 426
-          }
-        );
-
-      }
-
-
-      const id =
-        env.CHAT.idFromName(
-          "global-chat-room"
-        );
-
-
-      const room =
-        env.CHAT.get(id);
-
-
-      return room.fetch(
-        request
-      );
-
-    }
-
-
-    /* HEALTH */
-
-    if (
-      url.pathname === "/health"
-    ) {
-
-      return new Response(
-
-        JSON.stringify({
-
-          ok: true,
-
-          service:
-            "RandomTalk",
-
-          time:
-            new Date().toISOString()
-
-        }),
-
-        {
-          headers: {
-            "content-type":
-              "application/json"
-          }
-        }
-
-      );
-
-    }
-
-
-    /* WEBSITE */
-
-    return new Response(
-      HTML_PAGE,
-      {
-        headers: {
-          "content-type":
-            "text/html; charset=UTF-8"
-        }
-      }
-    );
-
-  }
-
-};
