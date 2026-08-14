@@ -2581,6 +2581,11 @@ let currentMode = "video";
 
 let connected = false;
 
+let sessionActive = false;
+let videoConnected = false;
+let reconnectInProgress = false;
+let reconnectTimer = null;
+
 let isInitiator = false;
 
 let localStream = null;
@@ -2760,11 +2765,16 @@ function connectSocket() {
   socket.onopen =
     () => {
 
-      setStatus(
-        "Connected. Looking for a stranger..."
-      );
+      if (sessionActive) {
+        setStatus(
+          "Connected. Looking for a stranger..."
+        );
+        joinRoom();
+      } else {
+        setStatus("Connected.");
+      }
 
-      joinRoom();
+      updateButtons();
 
     };
 
@@ -2807,6 +2817,13 @@ function connectSocket() {
     () => {
 
       connected = false;
+      videoConnected = false;
+      sessionActive = false;
+      reconnectInProgress = false;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
 
       closePeerConnection();
 
@@ -2899,6 +2916,8 @@ async function handleMessage(
   ) {
 
     connected = false;
+    videoConnected = false;
+    sessionActive = true;
 
     setStatus(
       "Looking for another person..."
@@ -3034,6 +3053,8 @@ async function handleMessage(
   ) {
 
     connected = false;
+    videoConnected = false;
+    sessionActive = true;
 
     closePeerConnection();
 
@@ -3100,22 +3121,36 @@ async function handleMessage(
 
 function startChat() {
 
-  manualClose = false;
-
-
-  if (
-    !socket ||
-    socket.readyState !==
-    WebSocket.OPEN
-  ) {
-
-    connectSocket();
-
+  if (sessionActive) {
     return;
   }
 
+  manualClose = false;
+  sessionActive = true;
+  connected = false;
+  videoConnected = false;
 
-  joinRoom();
+  videoCard.style.display = "block";
+  placeholderText.textContent =
+    "Connecting to RandomTalk...";
+  videoPlaceholder.classList.remove("hidden");
+  setStatus("Connecting to RandomTalk...");
+
+  if (
+    !socket ||
+    socket.readyState === WebSocket.CLOSED ||
+    socket.readyState === WebSocket.CLOSING
+  ) {
+    connectSocket();
+    updateButtons();
+    return;
+  }
+
+  if (socket.readyState === WebSocket.OPEN) {
+    joinRoom();
+  }
+
+  updateButtons();
 }
 
 
@@ -3126,16 +3161,16 @@ function startChat() {
 function nextChat() {
 
   if (
+    !sessionActive ||
     !socket ||
     socket.readyState !==
     WebSocket.OPEN
   ) {
-
     return;
   }
 
-
   connected = false;
+  videoConnected = false;
 
 
   closePeerConnection();
@@ -3228,20 +3263,17 @@ function endChat() {
 
 function updateButtons() {
 
-  startBtn.disabled =
-    connected;
+  // Start is unavailable while this browser is already
+  // searching or talking to someone.
+  startBtn.disabled = sessionActive;
 
+  // Next and End are available throughout an active session,
+  // including while waiting for a match or after a partner leaves.
+  nextBtn.disabled = !sessionActive;
+  endBtn.disabled = !sessionActive;
 
-  nextBtn.disabled =
-    !connected;
-
-
-  endBtn.disabled =
-    !connected;
-
-
-  reportBtn.disabled =
-    !connected;
+  // Reporting only makes sense when a partner is currently matched.
+  reportBtn.disabled = !connected;
 }
 
 
@@ -3461,6 +3493,13 @@ async function createPeerConnection() {
         state ===
         "connected"
       ) {
+        videoConnected = true;
+        reconnectInProgress = false;
+
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
 
         setStatus(
           "Video connected.",
@@ -3477,6 +3516,7 @@ async function createPeerConnection() {
         state ===
         "connecting"
       ) {
+        videoConnected = false;
 
         setStatus(
           "Connecting video..."
@@ -3488,15 +3528,13 @@ async function createPeerConnection() {
         state ===
         "disconnected"
       ) {
+        videoConnected = false;
 
         setStatus(
           "Video connection unstable. Reconnecting..."
         );
 
-        setTimeout(
-          restartVideo,
-          1000
-        );
+        scheduleReconnect(1000);
       }
 
 
@@ -3504,15 +3542,13 @@ async function createPeerConnection() {
         state ===
         "failed"
       ) {
+        videoConnected = false;
 
         setStatus(
           "Video connection failed. Reconnecting..."
         );
 
-        setTimeout(
-          restartVideo,
-          300
-        );
+        scheduleReconnect(300);
       }
     };
 
@@ -3542,8 +3578,8 @@ async function createPeerConnection() {
         state ===
         "failed"
       ) {
-
-        restartVideo();
+        videoConnected = false;
+        scheduleReconnect(500);
       }
     };
 
@@ -3821,61 +3857,64 @@ async function flushIce() {
    RESTART VIDEO
 ========================================================= */
 
-async function restartVideo() {
-
-  if (!connected) {
+function scheduleReconnect(delay = 500) {
+  if (!sessionActive || !connected || !isInitiator) {
     return;
   }
 
+  if (reconnectTimer) {
+    return;
+  }
+
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    await restartVideo();
+  }, delay);
+}
+
+
+async function restartVideo() {
+
+  if (
+    !sessionActive ||
+    !connected ||
+    !isInitiator ||
+    reconnectInProgress
+  ) {
+    return;
+  }
+
+  reconnectInProgress = true;
 
   try {
 
     if (!localStream) {
-
       await getLocalMedia();
     }
 
-
     if (!peerConnection) {
-
       await createPeerConnection();
     }
 
-
-    /*
-      Only caller creates
-      the ICE restart offer.
-    */
-
-    if (isInitiator) {
-
-      const offer =
-        await peerConnection
-          .createOffer({
-
-            iceRestart:
-              true
-
-          });
-
-
+    const offer =
       await peerConnection
-        .setLocalDescription(
-          offer
-        );
+        .createOffer({
+          iceRestart: true
+        });
 
+    await peerConnection
+      .setLocalDescription(
+        offer
+      );
 
-      sendSignal({
+    sendSignal({
+      type:
+        "offer",
 
-        type:
-          "offer",
-
-        sdp:
-          peerConnection
-            .localDescription
-
-      });
-    }
+      sdp:
+        peerConnection
+          .localDescription
+    });
 
   } catch (error) {
 
@@ -3883,6 +3922,9 @@ async function restartVideo() {
       "Restart video error:",
       error
     );
+
+  } finally {
+    reconnectInProgress = false;
   }
 }
 
@@ -3894,6 +3936,13 @@ async function restartVideo() {
 function closePeerConnection() {
 
   pendingIce = [];
+  videoConnected = false;
+  reconnectInProgress = false;
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
 
 
   if (
