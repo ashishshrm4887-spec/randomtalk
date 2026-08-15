@@ -229,10 +229,108 @@ export class ChatRoom extends DurableObject {
 
 
   /* =======================================================
+     ADMIN REPORT STORAGE
+  ======================================================= */
+
+  async adminListReports() {
+    const result = await this.ctx.storage.list({ prefix: "report:" });
+    const reports = [];
+
+    for (const value of result.values()) {
+      if (value && typeof value === "object") {
+        reports.push({
+          ...value,
+          status: value.status || "pending"
+        });
+      }
+    }
+
+    reports.sort((a, b) =>
+      String(b.createdAt || "").localeCompare(String(a.createdAt || ""))
+    );
+
+    return reports;
+  }
+
+  async adminUpdateReport(id, status) {
+    if (!id || !["pending", "reviewed", "resolved"].includes(status)) {
+      return false;
+    }
+
+    const key = "report:" + id;
+    const report = await this.ctx.storage.get(key);
+
+    if (!report) {
+      return false;
+    }
+
+    await this.ctx.storage.put(key, {
+      ...report,
+      status,
+      updatedAt: new Date().toISOString()
+    });
+
+    return true;
+  }
+
+  async adminDeleteReport(id) {
+    if (!id) return false;
+
+    const key = "report:" + id;
+    const exists = await this.ctx.storage.get(key);
+
+    if (!exists) return false;
+
+    await this.ctx.storage.delete(key);
+    return true;
+  }
+
+  /* =======================================================
      CONNECTION
   ======================================================= */
 
   async fetch(request) {
+
+    const url = new URL(request.url);
+
+    /* Internal admin requests are only reachable through the main Worker. */
+    if (request.headers.get("x-randomtalk-admin-action") === "1") {
+      if (url.pathname === "/_admin/reports") {
+        return Response.json(await this.adminListReports());
+      }
+
+      if (url.pathname === "/_admin/report/status" && request.method === "POST") {
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return Response.json({ ok: false, error: "Invalid JSON." }, { status: 400 });
+        }
+
+        const ok = await this.adminUpdateReport(body.id, body.status);
+        return Response.json(
+          { ok },
+          { status: ok ? 200 : 404 }
+        );
+      }
+
+      if (url.pathname === "/_admin/report/delete" && request.method === "POST") {
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return Response.json({ ok: false, error: "Invalid JSON." }, { status: 400 });
+        }
+
+        const ok = await this.adminDeleteReport(body.id);
+        return Response.json(
+          { ok },
+          { status: ok ? 200 : 404 }
+        );
+      }
+
+      return Response.json({ ok: false, error: "Not found." }, { status: 404 });
+    }
 
     if (
       request.headers.get("Upgrade")
@@ -1028,7 +1126,10 @@ export class ChatRoom extends DurableObject {
 
         country:
           info.country ||
-          "unknown"
+          "unknown",
+
+        status:
+          "pending"
 
       };
 
@@ -1163,6 +1264,153 @@ export class ChatRoom extends DurableObject {
 
 
 /* =========================================================
+   ADMIN AUTHENTICATION
+========================================================= */
+
+const ADMIN_COOKIE = "randomtalk_admin";
+const ADMIN_SESSION_MAX_AGE = 60 * 60 * 8;
+
+function base64UrlEncode(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function base64UrlDecode(value) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+  const binary = atob(padded);
+  return Uint8Array.from(binary, c => c.charCodeAt(0));
+}
+
+async function sha256(text) {
+  return new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(text)
+    )
+  );
+}
+
+async function hmac(secret, value) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  return new Uint8Array(
+    await crypto.subtle.sign(
+      "HMAC",
+      key,
+      new TextEncoder().encode(value)
+    )
+  );
+}
+
+function constantTimeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+async function verifyAdminPassword(password, expected) {
+  if (!expected || typeof password !== "string") return false;
+  const supplied = await sha256(password);
+  const stored = await sha256(expected);
+  return constantTimeEqual(supplied, stored);
+}
+
+async function createAdminSession(secret) {
+  const expires = Math.floor(Date.now() / 1000) + ADMIN_SESSION_MAX_AGE;
+  const payload = `${expires}`;
+  const signature = base64UrlEncode(await hmac(secret, payload));
+  return `${payload}.${signature}`;
+}
+
+async function verifyAdminSession(request, secret) {
+  if (!secret) return false;
+
+  const cookie = request.headers.get("Cookie") || "";
+  const match = cookie.match(/(?:^|;\s*)randomtalk_admin=([^;]+)/);
+  if (!match) return false;
+
+  const parts = match[1].split(".");
+  if (parts.length !== 2) return false;
+
+  const expires = Number(parts[0]);
+  if (!Number.isFinite(expires) || expires < Math.floor(Date.now() / 1000)) {
+    return false;
+  }
+
+  try {
+    const expected = await hmac(secret, parts[0]);
+    const actual = base64UrlDecode(parts[1]);
+    return constantTimeEqual(expected, actual);
+  } catch {
+    return false;
+  }
+}
+
+function adminCookie(value, maxAge) {
+  return `${ADMIN_COOKIE}=${value}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Strict`;
+}
+
+function sameOrigin(request) {
+  const origin = request.headers.get("Origin");
+  if (!origin) return true;
+  try {
+    return new URL(origin).origin === new URL(request.url).origin;
+  } catch {
+    return false;
+  }
+}
+
+async function callAdminDO(env, path, method = "GET", body = null) {
+  const id = env.CHAT.idFromName("global-video-room");
+  const room = env.CHAT.get(id);
+  const headers = new Headers({
+    "x-randomtalk-admin-action": "1"
+  });
+
+  if (body !== null) headers.set("content-type", "application/json");
+
+  return room.fetch(
+    new Request(`https://internal.randomtalk${path}`, {
+      method,
+      headers,
+      body: body === null ? undefined : JSON.stringify(body)
+    })
+  );
+}
+
+function adminLoginPage(message = "") {
+  return `<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>RandomTalk Admin</title>
+<style>body{margin:0;min-height:100vh;background:#070b16;color:#fff;font-family:system-ui;display:grid;place-items:center}.box{width:min(420px,calc(100% - 32px));background:#101827;border:1px solid #26304a;border-radius:18px;padding:24px;box-sizing:border-box}h1{margin-top:0}input,button{width:100%;box-sizing:border-box;padding:13px;border-radius:10px;font:inherit}input{background:#0b1220;border:1px solid #303b59;color:#fff;margin:12px 0}button{border:0;background:#7c3aed;color:#fff;font-weight:800}.error{color:#fb7185;margin-bottom:10px}</style></head>
+<body><div class="box"><h1>RandomTalk Admin</h1><p>Sign in to manage user reports.</p>${message ? `<div class="error">${message}</div>` : ""}<form method="post" action="/admin/login"><input type="password" name="password" autocomplete="current-password" placeholder="Admin password" required><button>Sign in</button></form></div></body></html>`;
+}
+
+const ADMIN_PAGE = `<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>RandomTalk Reports</title>
+<style>body{margin:0;background:#070b16;color:#fff;font-family:system-ui}header{padding:18px 20px;border-bottom:1px solid #26304a;display:flex;justify-content:space-between;gap:12px;align-items:center}main{max-width:1100px;margin:auto;padding:20px}.stats{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}.stat{background:#101827;border:1px solid #26304a;border-radius:14px;padding:14px 18px}.reports{display:grid;gap:14px}.report{background:#101827;border:1px solid #26304a;border-radius:16px;padding:16px}.meta{color:#94a3b8;font-size:13px;line-height:1.6}.details{margin:12px 0;white-space:pre-wrap;word-break:break-word}.actions{display:flex;gap:8px;flex-wrap:wrap}button{border:1px solid #303b59;background:#182238;color:#fff;border-radius:9px;padding:9px 12px;font-weight:700}.danger{background:#35131b;color:#fb7185}.empty{color:#94a3b8;padding:30px 0}select{background:#182238;color:#fff;border:1px solid #303b59;border-radius:9px;padding:9px}</style></head>
+<body><header><strong>RandomTalk Admin</strong><form method="post" action="/admin/logout"><button>Log out</button></form></header><main><div class="stats"><div class="stat">Total: <b id="total">0</b></div><div class="stat">Pending: <b id="pending">0</b></div></div><div id="reports" class="reports"><div class="empty">Loading reports...</div></div></main>
+<script>
+const esc=s=>String(s??"").replace(/[&<>\"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+async function api(path,method="GET",body){const r=await fetch(path,{method,headers:body?{"content-type":"application/json"}:undefined,body:body?JSON.stringify(body):undefined});if(r.status===401){location.reload();return null}return r.json()}
+async function load(){const data=await api('/admin/api/reports');if(!data)return;document.getElementById('total').textContent=data.length;document.getElementById('pending').textContent=data.filter(x=>(x.status||'pending')==='pending').length;const root=document.getElementById('reports');if(!data.length){root.innerHTML='<div class="empty">No reports yet.</div>';return}root.innerHTML=data.map(r=>{const status=r.status||'pending';return `<article class="report"><div><b>${esc(r.reason)}</b> — <span>${esc(status)}</span></div><div class="meta">Created: ${esc(r.createdAt)}<br>Reporter: ${esc(r.reporterId)}<br>Reported user: ${esc(r.reportedUserId)}<br>Country: ${esc(r.country)}</div><div class="details">${esc(r.details||'No details')}</div><div class="actions"><select onchange="setStatus('${esc(r.id)}',this.value)"><option value="pending" ${status==='pending'?'selected':''}>Pending</option><option value="reviewed" ${status==='reviewed'?'selected':''}>Reviewed</option><option value="resolved" ${status==='resolved'?'selected':''}>Resolved</option></select><button class="danger" onclick="removeReport('${esc(r.id)}')">Delete</button></div></article>`}).join('')}
+async function setStatus(id,status){await api('/admin/api/report/status','POST',{id,status});await load()}
+async function removeReport(id){if(!confirm('Delete this report permanently?'))return;await api('/admin/api/report/delete','POST',{id});await load()}
+load();setInterval(load,30000);
+</script></body></html>`;
+
+/* =========================================================
    MAIN WORKER
 ========================================================= */
 
@@ -1177,6 +1425,84 @@ export default {
       new URL(
         request.url
       );
+
+    const adminPassword = env.ADMIN_PASSWORD;
+    const adminSessionSecret =
+      env.ADMIN_SESSION_SECRET || adminPassword;
+
+    /* =========================
+       ADMIN LOGIN / DASHBOARD
+    ========================= */
+
+    if (url.pathname === "/admin/login" && request.method === "POST") {
+      if (!sameOrigin(request)) {
+        return new Response("Forbidden", { status: 403 });
+      }
+
+      const form = await request.formData();
+      const password = String(form.get("password") || "");
+
+      if (!(await verifyAdminPassword(password, adminPassword))) {
+        return new Response(adminLoginPage("Incorrect password."), {
+          status: 401,
+          headers: { "content-type": "text/html; charset=UTF-8" }
+        });
+      }
+
+      const token = await createAdminSession(adminSessionSecret);
+      return new Response(null, {
+        status: 303,
+        headers: {
+          Location: "/admin",
+          "Set-Cookie": adminCookie(token, ADMIN_SESSION_MAX_AGE)
+        }
+      });
+    }
+
+    if (url.pathname === "/admin/logout" && request.method === "POST") {
+      return new Response(null, {
+        status: 303,
+        headers: {
+          Location: "/admin",
+          "Set-Cookie": adminCookie("", 0)
+        }
+      });
+    }
+
+    if (url.pathname === "/admin") {
+      if (!(await verifyAdminSession(request, adminSessionSecret))) {
+        return new Response(adminLoginPage(), {
+          headers: { "content-type": "text/html; charset=UTF-8", "cache-control": "no-store" }
+        });
+      }
+
+      return new Response(ADMIN_PAGE, {
+        headers: { "content-type": "text/html; charset=UTF-8", "cache-control": "no-store" }
+      });
+    }
+
+    if (url.pathname.startsWith("/admin/api/")) {
+      if (!(await verifyAdminSession(request, adminSessionSecret))) {
+        return Response.json({ ok: false, error: "Unauthorized." }, { status: 401 });
+      }
+
+      if (!sameOrigin(request)) {
+        return Response.json({ ok: false, error: "Forbidden." }, { status: 403 });
+      }
+
+      const path = url.pathname.replace("/admin/api", "/_admin");
+      const response = await callAdminDO(
+        env,
+        path,
+        request.method,
+        request.method === "POST" ? await request.json().catch(() => ({})) : null
+      );
+
+      return new Response(response.body, {
+        status: response.status,
+        headers: { "content-type": "application/json", "cache-control": "no-store" }
+      });
+    }
 
 
     /* =========================
@@ -3233,7 +3559,9 @@ function endChat() {
 
 
   connected = false;
-
+  videoConnected = false;
+  sessionActive = false;
+  reconnectInProgress = false;
 
   closePeerConnection();
 
