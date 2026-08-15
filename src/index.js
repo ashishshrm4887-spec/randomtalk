@@ -1331,14 +1331,27 @@ function constantTimeEqual(a, b) {
 }
 
 async function verifyAdminPassword(password, expected) {
-  if (!expected || typeof password !== "string") return false;
+  const stored = String(expected ?? "").trim();
+  const supplied = String(password ?? "").trim();
 
-  const a = await hmacSha256(expected, password);
-  const b = await hmacSha256(expected, expected);
+  if (!stored || !supplied) return false;
 
-  return constantTimeEqual(a, await hmacSha256(expected, password)) && password === expected;
+  const suppliedHash = new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(supplied)
+    )
+  );
+
+  const storedHash = new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(stored)
+    )
+  );
+
+  return constantTimeEqual(suppliedHash, storedHash);
 }
-
 async function createAdminSession(secret) {
   const expires = Math.floor(Date.now() / 1000) + ADMIN_SESSION_MAX_AGE;
   const payload = String(expires);
@@ -1439,9 +1452,16 @@ export default {
       }
 
       const form = await request.formData();
-      const password = String(form.get("password") || "");
+      const password = String(form.get("password") ?? "");
 
-      if (!adminPassword || password !== adminPassword) {
+      if (!String(adminPassword ?? "").trim()) {
+        return new Response(adminLoginPage("ADMIN_PASSWORD is not configured on this deployed Worker."), {
+          status: 500,
+          headers: { "content-type": "text/html; charset=UTF-8", "cache-control": "no-store" }
+        });
+      }
+
+      if (!(await verifyAdminPassword(password, adminPassword))) {
         return new Response(adminLoginPage("Incorrect password."), {
           status: 401,
           headers: { "content-type": "text/html; charset=UTF-8", "cache-control": "no-store" }
