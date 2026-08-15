@@ -228,9 +228,39 @@ export class ChatRoom extends DurableObject {
   }
 
 
+
+
   /* =======================================================
-     ADMIN REPORT STORAGE
+     ADMIN DATA
   ======================================================= */
+
+  async adminStats() {
+    const users = [];
+
+    for (const ws of this.getSockets()) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+
+      const info = this.getInfo(ws);
+
+      users.push({
+        id: info.id || "unknown",
+        status: info.status || "idle",
+        mode: info.mode || "video",
+        gender: info.gender || "other",
+        country: info.country || "any",
+        partnerId: info.partnerId || null,
+        joinedAt: info.joinedAt || null
+      });
+    }
+
+    return {
+      online: users.length,
+      waiting: users.filter(u => u.status === "waiting").length,
+      matched: users.filter(u => u.status === "matched").length,
+      idle: users.filter(u => u.status === "idle").length,
+      users
+    };
+  }
 
   async adminListReports() {
     const result = await this.ctx.storage.list({ prefix: "report:" });
@@ -260,9 +290,7 @@ export class ChatRoom extends DurableObject {
     const key = "report:" + id;
     const report = await this.ctx.storage.get(key);
 
-    if (!report) {
-      return false;
-    }
+    if (!report) return false;
 
     await this.ctx.storage.put(key, {
       ...report,
@@ -277,9 +305,9 @@ export class ChatRoom extends DurableObject {
     if (!id) return false;
 
     const key = "report:" + id;
-    const exists = await this.ctx.storage.get(key);
+    const report = await this.ctx.storage.get(key);
 
-    if (!exists) return false;
+    if (!report) return false;
 
     await this.ctx.storage.delete(key);
     return true;
@@ -293,8 +321,11 @@ export class ChatRoom extends DurableObject {
 
     const url = new URL(request.url);
 
-    /* Internal admin requests are only reachable through the main Worker. */
     if (request.headers.get("x-randomtalk-admin-action") === "1") {
+      if (url.pathname === "/_admin/stats") {
+        return Response.json(await this.adminStats());
+      }
+
       if (url.pathname === "/_admin/reports") {
         return Response.json(await this.adminListReports());
       }
@@ -308,10 +339,7 @@ export class ChatRoom extends DurableObject {
         }
 
         const ok = await this.adminUpdateReport(body.id, body.status);
-        return Response.json(
-          { ok },
-          { status: ok ? 200 : 404 }
-        );
+        return Response.json({ ok }, { status: ok ? 200 : 404 });
       }
 
       if (url.pathname === "/_admin/report/delete" && request.method === "POST") {
@@ -323,10 +351,7 @@ export class ChatRoom extends DurableObject {
         }
 
         const ok = await this.adminDeleteReport(body.id);
-        return Response.json(
-          { ok },
-          { status: ok ? 200 : 404 }
-        );
+        return Response.json({ ok }, { status: ok ? 200 : 404 });
       }
 
       return Response.json({ ok: false, error: "Not found." }, { status: 404 });
@@ -1126,10 +1151,7 @@ export class ChatRoom extends DurableObject {
 
         country:
           info.country ||
-          "unknown",
-
-        status:
-          "pending"
+          "unknown"
 
       };
 
@@ -1263,8 +1285,10 @@ export class ChatRoom extends DurableObject {
 }
 
 
+
+
 /* =========================================================
-   ADMIN AUTHENTICATION
+   ADMIN AUTHENTICATION + DASHBOARD
 ========================================================= */
 
 const ADMIN_COOKIE = "randomtalk_admin";
@@ -1273,10 +1297,7 @@ const ADMIN_SESSION_MAX_AGE = 60 * 60 * 8;
 function base64UrlEncode(bytes) {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 function base64UrlDecode(value) {
@@ -1286,16 +1307,7 @@ function base64UrlDecode(value) {
   return Uint8Array.from(binary, c => c.charCodeAt(0));
 }
 
-async function sha256(text) {
-  return new Uint8Array(
-    await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(text)
-    )
-  );
-}
-
-async function hmac(secret, value) {
+async function hmacSha256(secret, value) {
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
@@ -1304,13 +1316,11 @@ async function hmac(secret, value) {
     ["sign"]
   );
 
-  return new Uint8Array(
-    await crypto.subtle.sign(
-      "HMAC",
-      key,
-      new TextEncoder().encode(value)
-    )
-  );
+  return new Uint8Array(await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(value)
+  ));
 }
 
 function constantTimeEqual(a, b) {
@@ -1322,15 +1332,17 @@ function constantTimeEqual(a, b) {
 
 async function verifyAdminPassword(password, expected) {
   if (!expected || typeof password !== "string") return false;
-  const supplied = await sha256(password);
-  const stored = await sha256(expected);
-  return constantTimeEqual(supplied, stored);
+
+  const a = await hmacSha256(expected, password);
+  const b = await hmacSha256(expected, expected);
+
+  return constantTimeEqual(a, await hmacSha256(expected, password)) && password === expected;
 }
 
 async function createAdminSession(secret) {
   const expires = Math.floor(Date.now() / 1000) + ADMIN_SESSION_MAX_AGE;
-  const payload = `${expires}`;
-  const signature = base64UrlEncode(await hmac(secret, payload));
+  const payload = String(expires);
+  const signature = base64UrlEncode(await hmacSha256(secret, payload));
   return `${payload}.${signature}`;
 }
 
@@ -1345,12 +1357,10 @@ async function verifyAdminSession(request, secret) {
   if (parts.length !== 2) return false;
 
   const expires = Number(parts[0]);
-  if (!Number.isFinite(expires) || expires < Math.floor(Date.now() / 1000)) {
-    return false;
-  }
+  if (!Number.isFinite(expires) || expires < Math.floor(Date.now() / 1000)) return false;
 
   try {
-    const expected = await hmac(secret, parts[0]);
+    const expected = await hmacSha256(secret, parts[0]);
     const actual = base64UrlDecode(parts[1]);
     return constantTimeEqual(expected, actual);
   } catch {
@@ -1358,13 +1368,14 @@ async function verifyAdminSession(request, secret) {
   }
 }
 
-function adminCookie(value, maxAge) {
+function makeAdminCookie(value, maxAge) {
   return `${ADMIN_COOKIE}=${value}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Strict`;
 }
 
 function sameOrigin(request) {
   const origin = request.headers.get("Origin");
   if (!origin) return true;
+
   try {
     return new URL(origin).origin === new URL(request.url).origin;
   } catch {
@@ -1381,34 +1392,23 @@ async function callAdminDO(env, path, method = "GET", body = null) {
 
   if (body !== null) headers.set("content-type", "application/json");
 
-  return room.fetch(
-    new Request(`https://internal.randomtalk${path}`, {
-      method,
-      headers,
-      body: body === null ? undefined : JSON.stringify(body)
-    })
-  );
+  return room.fetch(new Request(`https://internal.randomtalk${path}`, {
+    method,
+    headers,
+    body: body === null ? undefined : JSON.stringify(body)
+  }));
 }
 
 function adminLoginPage(message = "") {
-  return `<!doctype html>
-<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>RandomTalk Admin</title>
-<style>body{margin:0;min-height:100vh;background:#070b16;color:#fff;font-family:system-ui;display:grid;place-items:center}.box{width:min(420px,calc(100% - 32px));background:#101827;border:1px solid #26304a;border-radius:18px;padding:24px;box-sizing:border-box}h1{margin-top:0}input,button{width:100%;box-sizing:border-box;padding:13px;border-radius:10px;font:inherit}input{background:#0b1220;border:1px solid #303b59;color:#fff;margin:12px 0}button{border:0;background:#7c3aed;color:#fff;font-weight:800}.error{color:#fb7185;margin-bottom:10px}</style></head>
-<body><div class="box"><h1>RandomTalk Admin</h1><p>Sign in to manage user reports.</p>${message ? `<div class="error">${message}</div>` : ""}<form method="post" action="/admin/login"><input type="password" name="password" autocomplete="current-password" placeholder="Admin password" required><button>Sign in</button></form></div></body></html>`;
+  const safe = String(message).replace(/[&<>"']/g, c => ({
+    "&":"&amp;", "<":"&lt;", ">":"&gt;", "\"":"&quot;", "'":"&#039;"
+  }[c]));
+
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>RandomTalk Admin</title><style>body{margin:0;min-height:100vh;background:#070b16;color:#fff;font-family:system-ui;display:grid;place-items:center}.box{width:min(420px,calc(100% - 32px));background:#101827;border:1px solid #26304a;border-radius:18px;padding:24px;box-sizing:border-box}h1{margin-top:0}input,button{width:100%;box-sizing:border-box;padding:13px;border-radius:10px;font:inherit}input{background:#0b1220;border:1px solid #303b59;color:#fff;margin:12px 0}button{border:0;background:#7c3aed;color:#fff;font-weight:800}.error{color:#fb7185;margin-bottom:10px}</style></head><body><div class="box"><h1>🔐 RandomTalk Admin</h1><p>Administrator access only.</p>${safe ? `<div class="error">${safe}</div>` : ""}<form method="post" action="/admin/login"><input type="password" name="password" autocomplete="current-password" placeholder="Admin password" required><button>Sign in</button></form></div></body></html>`;
 }
 
-const ADMIN_PAGE = `<!doctype html>
-<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>RandomTalk Reports</title>
-<style>body{margin:0;background:#070b16;color:#fff;font-family:system-ui}header{padding:18px 20px;border-bottom:1px solid #26304a;display:flex;justify-content:space-between;gap:12px;align-items:center}main{max-width:1100px;margin:auto;padding:20px}.stats{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}.stat{background:#101827;border:1px solid #26304a;border-radius:14px;padding:14px 18px}.reports{display:grid;gap:14px}.report{background:#101827;border:1px solid #26304a;border-radius:16px;padding:16px}.meta{color:#94a3b8;font-size:13px;line-height:1.6}.details{margin:12px 0;white-space:pre-wrap;word-break:break-word}.actions{display:flex;gap:8px;flex-wrap:wrap}button{border:1px solid #303b59;background:#182238;color:#fff;border-radius:9px;padding:9px 12px;font-weight:700}.danger{background:#35131b;color:#fb7185}.empty{color:#94a3b8;padding:30px 0}select{background:#182238;color:#fff;border:1px solid #303b59;border-radius:9px;padding:9px}</style></head>
-<body><header><strong>RandomTalk Admin</strong><form method="post" action="/admin/logout"><button>Log out</button></form></header><main><div class="stats"><div class="stat">Total: <b id="total">0</b></div><div class="stat">Pending: <b id="pending">0</b></div></div><div id="reports" class="reports"><div class="empty">Loading reports...</div></div></main>
-<script>
-const esc=s=>String(s??"").replace(/[&<>\"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
-async function api(path,method="GET",body){const r=await fetch(path,{method,headers:body?{"content-type":"application/json"}:undefined,body:body?JSON.stringify(body):undefined});if(r.status===401){location.reload();return null}return r.json()}
-async function load(){const data=await api('/admin/api/reports');if(!data)return;document.getElementById('total').textContent=data.length;document.getElementById('pending').textContent=data.filter(x=>(x.status||'pending')==='pending').length;const root=document.getElementById('reports');if(!data.length){root.innerHTML='<div class="empty">No reports yet.</div>';return}root.innerHTML=data.map(r=>{const status=r.status||"pending";return "<article class=\"report\"><div><b>"+esc(r.reason)+"</b> — <span>"+esc(status)+"</span></div><div class=\"meta\">Created: "+esc(r.createdAt)+"<br>Reporter: "+esc(r.reporterId)+"<br>Reported user: "+esc(r.reportedUserId)+"<br>Country: "+esc(r.country)+"</div><div class=\"details\">"+esc(r.details||"No details")+"</div><div class=\"actions\"><select onchange=\"setStatus('"+esc(r.id)+"',this.value)\"><option value=\"pending\" "+(status==="pending"?"selected":"")+">Pending</option><option value=\"reviewed\" "+(status==="reviewed"?"selected":"")+">Reviewed</option><option value=\"resolved\" "+(status==="resolved"?"selected":"")+">Resolved</option></select><button class=\"danger\" onclick=\"removeReport('"+esc(r.id)+"')\">Delete</button></div></article>"}).join('')}
-async function setStatus(id,status){await api('/admin/api/report/status','POST',{id,status});await load()}
-async function removeReport(id){if(!confirm('Delete this report permanently?'))return;await api('/admin/api/report/delete','POST',{id});await load()}
-load();setInterval(load,30000);
-</script></body></html>`;
+const ADMIN_PAGE = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>RandomTalk Admin</title><style>*{box-sizing:border-box}body{margin:0;background:#070b16;color:#fff;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}header{padding:18px 20px;border-bottom:1px solid #26304a;display:flex;justify-content:space-between;align-items:center;gap:12px}header strong{font-size:20px}main{max-width:1200px;margin:auto;padding:20px}.actions{display:flex;gap:8px;align-items:center}.actions button{width:auto}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}.stat{background:#101827;border:1px solid #26304a;border-radius:14px;padding:18px}.label{color:#94a3b8;font-size:13px}.number{display:block;margin-top:7px;font-size:30px;font-weight:900}.card{background:#101827;border:1px solid #26304a;border-radius:16px;padding:16px;margin-bottom:20px}.card h2{margin-top:0}.table-wrap{width:100%;overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:800px}th,td{text-align:left;padding:12px;border-bottom:1px solid #202b42;font-size:13px}th{color:#94a3b8}.badge{display:inline-block;padding:5px 8px;border-radius:8px;background:#182238;font-size:12px}.reports{display:grid;gap:14px}.report{background:#0b1220;border:1px solid #26304a;border-radius:14px;padding:16px}.meta{color:#94a3b8;font-size:13px;line-height:1.7;margin-top:8px}.details{margin:12px 0;white-space:pre-wrap;word-break:break-word}.report-actions{display:flex;gap:8px;flex-wrap:wrap}.report-actions button,.report-actions select,.actions button{border:1px solid #303b59;background:#182238;color:#fff;border-radius:9px;padding:9px 12px;font-weight:700;cursor:pointer}.refresh{background:#7c3aed!important;border-color:#7c3aed!important}.danger{background:#35131b!important;color:#fb7185!important}.empty{color:#94a3b8;padding:25px 0}@media(max-width:800px){.stats{grid-template-columns:1fr 1fr}main{padding:12px}}
+</style></head><body><header><strong>💬 RandomTalk Admin</strong><div class="actions"><button class="refresh" onclick="loadAll()">↻ Refresh</button><form method="post" action="/admin/logout"><button>Log out</button></form></div></header><main><div class="stats"><div class="stat"><span class="label">Online</span><span id="online" class="number">0</span></div><div class="stat"><span class="label">Waiting</span><span id="waiting" class="number">0</span></div><div class="stat"><span class="label">Active Chats</span><span id="matched" class="number">0</span></div><div class="stat"><span class="label">Reports</span><span id="reportTotal" class="number">0</span></div></div><div class="card"><h2>👥 Live Users</h2><div class="table-wrap"><table><thead><tr><th>User ID</th><th>Status</th><th>Mode</th><th>Gender</th><th>Country</th><th>Partner</th></tr></thead><tbody id="users"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody></table></div></div><div class="card"><h2>⚠ Reports</h2><div id="reports" class="reports"><div class="empty">Loading reports...</div></div></div></main><script>"use strict";const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]));async function api(path,method="GET",body=null){const o={method,cache:"no-store"};if(body!==null){o.headers={"content-type":"application/json"};o.body=JSON.stringify(body)}const r=await fetch(path,o);if(r.status===401){location.reload();return null}if(!r.ok)throw new Error("Request failed");return r.json()}async function loadStats(){const d=await api("/admin/api/stats");if(!d)return;document.getElementById("online").textContent=d.online;document.getElementById("waiting").textContent=d.waiting;document.getElementById("matched").textContent=d.matched;const root=document.getElementById("users");root.innerHTML=d.users.length?d.users.map(u=>`<tr><td><code>${esc(u.id)}</code></td><td><span class="badge">${esc(u.status)}</span></td><td>${esc(u.mode)}</td><td>${esc(u.gender)}</td><td>${esc(u.country)}</td><td><code>${esc(u.partnerId||"-")}</code></td></tr>`).join(""):`<tr><td colspan="6" class="empty">No users online.</td></tr>`}async function loadReports(){const d=await api("/admin/api/reports");if(!d)return;document.getElementById("reportTotal").textContent=d.length;const root=document.getElementById("reports");root.innerHTML=d.length?d.map(r=>{const st=r.status||"pending";return `<article class="report"><div><b>${esc(r.reason)}</b> — <span class="badge">${esc(st)}</span></div><div class="meta">Created: ${esc(r.createdAt)}<br>Reporter: <code>${esc(r.reporterId)}</code><br>Reported user: <code>${esc(r.reportedUserId)}</code><br>Country: ${esc(r.country)}</div><div class="details">${esc(r.details||"No details")}</div><div class="report-actions"><select onchange="setStatus('${esc(r.id)}',this.value)"><option value="pending" ${st==="pending"?"selected":""}>Pending</option><option value="reviewed" ${st==="reviewed"?"selected":""}>Reviewed</option><option value="resolved" ${st==="resolved"?"selected":""}>Resolved</option></select><button class="danger" onclick="removeReport('${esc(r.id)}')">Delete</button></div></article>`}).join(""):"<div class=\"empty\">No reports yet.</div>"}async function loadAll(){try{await Promise.all([loadStats(),loadReports()])}catch(e){console.error(e)}}async function setStatus(id,status){await api("/admin/api/report/status","POST",{id,status});await loadReports()}async function removeReport(id){if(!confirm("Delete this report permanently?"))return;await api("/admin/api/report/delete","POST",{id});await loadReports()}loadAll();setInterval(loadAll,10000);</script></body></html>`;
 
 /* =========================================================
    MAIN WORKER
@@ -1427,8 +1427,7 @@ export default {
       );
 
     const adminPassword = env.ADMIN_PASSWORD;
-    const adminSessionSecret =
-      env.ADMIN_SESSION_SECRET || adminPassword;
+    const adminSessionSecret = env.ADMIN_SESSION_SECRET || adminPassword;
 
     /* =========================
        ADMIN LOGIN / DASHBOARD
@@ -1442,10 +1441,10 @@ export default {
       const form = await request.formData();
       const password = String(form.get("password") || "");
 
-      if (!(await verifyAdminPassword(password, adminPassword))) {
+      if (!adminPassword || password !== adminPassword) {
         return new Response(adminLoginPage("Incorrect password."), {
           status: 401,
-          headers: { "content-type": "text/html; charset=UTF-8" }
+          headers: { "content-type": "text/html; charset=UTF-8", "cache-control": "no-store" }
         });
       }
 
@@ -1454,7 +1453,7 @@ export default {
         status: 303,
         headers: {
           Location: "/admin",
-          "Set-Cookie": adminCookie(token, ADMIN_SESSION_MAX_AGE)
+          "Set-Cookie": makeAdminCookie(token, ADMIN_SESSION_MAX_AGE)
         }
       });
     }
@@ -1464,7 +1463,7 @@ export default {
         status: 303,
         headers: {
           Location: "/admin",
-          "Set-Cookie": adminCookie("", 0)
+          "Set-Cookie": makeAdminCookie("", 0)
         }
       });
     }
@@ -1490,18 +1489,17 @@ export default {
         return Response.json({ ok: false, error: "Forbidden." }, { status: 403 });
       }
 
-      const path = url.pathname.replace("/admin/api", "/_admin");
-      const response = await callAdminDO(
-        env,
-        path,
-        request.method,
-        request.method === "POST" ? await request.json().catch(() => ({})) : null
-      );
+      let body = null;
+      if (request.method === "POST") {
+        try { body = await request.json(); } catch { return Response.json({ ok: false, error: "Invalid JSON." }, { status: 400 }); }
+      }
 
-      return new Response(response.body, {
-        status: response.status,
-        headers: { "content-type": "application/json", "cache-control": "no-store" }
-      });
+      const path = url.pathname.replace("/admin/api", "/_admin");
+      const response = await callAdminDO(env, path, request.method, body);
+      const headers = new Headers(response.headers);
+      headers.set("content-type", "application/json");
+      headers.set("cache-control", "no-store");
+      return new Response(response.body, { status: response.status, headers });
     }
 
 
@@ -2907,11 +2905,6 @@ let currentMode = "video";
 
 let connected = false;
 
-let sessionActive = false;
-let videoConnected = false;
-let reconnectInProgress = false;
-let reconnectTimer = null;
-
 let isInitiator = false;
 
 let localStream = null;
@@ -3091,16 +3084,11 @@ function connectSocket() {
   socket.onopen =
     () => {
 
-      if (sessionActive) {
-        setStatus(
-          "Connected. Looking for a stranger..."
-        );
-        joinRoom();
-      } else {
-        setStatus("Connected.");
-      }
+      setStatus(
+        "Connected. Looking for a stranger..."
+      );
 
-      updateButtons();
+      joinRoom();
 
     };
 
@@ -3143,13 +3131,6 @@ function connectSocket() {
     () => {
 
       connected = false;
-      videoConnected = false;
-      sessionActive = false;
-      reconnectInProgress = false;
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
 
       closePeerConnection();
 
@@ -3242,8 +3223,6 @@ async function handleMessage(
   ) {
 
     connected = false;
-    videoConnected = false;
-    sessionActive = true;
 
     setStatus(
       "Looking for another person..."
@@ -3379,8 +3358,6 @@ async function handleMessage(
   ) {
 
     connected = false;
-    videoConnected = false;
-    sessionActive = true;
 
     closePeerConnection();
 
@@ -3447,36 +3424,22 @@ async function handleMessage(
 
 function startChat() {
 
-  if (sessionActive) {
-    return;
-  }
-
   manualClose = false;
-  sessionActive = true;
-  connected = false;
-  videoConnected = false;
 
-  videoCard.style.display = "block";
-  placeholderText.textContent =
-    "Connecting to RandomTalk...";
-  videoPlaceholder.classList.remove("hidden");
-  setStatus("Connecting to RandomTalk...");
 
   if (
     !socket ||
-    socket.readyState === WebSocket.CLOSED ||
-    socket.readyState === WebSocket.CLOSING
+    socket.readyState !==
+    WebSocket.OPEN
   ) {
+
     connectSocket();
-    updateButtons();
+
     return;
   }
 
-  if (socket.readyState === WebSocket.OPEN) {
-    joinRoom();
-  }
 
-  updateButtons();
+  joinRoom();
 }
 
 
@@ -3487,16 +3450,16 @@ function startChat() {
 function nextChat() {
 
   if (
-    !sessionActive ||
     !socket ||
     socket.readyState !==
     WebSocket.OPEN
   ) {
+
     return;
   }
 
+
   connected = false;
-  videoConnected = false;
 
 
   closePeerConnection();
@@ -3559,9 +3522,7 @@ function endChat() {
 
 
   connected = false;
-  videoConnected = false;
-  sessionActive = false;
-  reconnectInProgress = false;
+
 
   closePeerConnection();
 
@@ -3591,17 +3552,20 @@ function endChat() {
 
 function updateButtons() {
 
-  // Start is unavailable while this browser is already
-  // searching or talking to someone.
-  startBtn.disabled = sessionActive;
+  startBtn.disabled =
+    connected;
 
-  // Next and End are available throughout an active session,
-  // including while waiting for a match or after a partner leaves.
-  nextBtn.disabled = !sessionActive;
-  endBtn.disabled = !sessionActive;
 
-  // Reporting only makes sense when a partner is currently matched.
-  reportBtn.disabled = !connected;
+  nextBtn.disabled =
+    !connected;
+
+
+  endBtn.disabled =
+    !connected;
+
+
+  reportBtn.disabled =
+    !connected;
 }
 
 
@@ -3821,13 +3785,6 @@ async function createPeerConnection() {
         state ===
         "connected"
       ) {
-        videoConnected = true;
-        reconnectInProgress = false;
-
-        if (reconnectTimer) {
-          clearTimeout(reconnectTimer);
-          reconnectTimer = null;
-        }
 
         setStatus(
           "Video connected.",
@@ -3844,7 +3801,6 @@ async function createPeerConnection() {
         state ===
         "connecting"
       ) {
-        videoConnected = false;
 
         setStatus(
           "Connecting video..."
@@ -3856,13 +3812,15 @@ async function createPeerConnection() {
         state ===
         "disconnected"
       ) {
-        videoConnected = false;
 
         setStatus(
           "Video connection unstable. Reconnecting..."
         );
 
-        scheduleReconnect(1000);
+        setTimeout(
+          restartVideo,
+          1000
+        );
       }
 
 
@@ -3870,13 +3828,15 @@ async function createPeerConnection() {
         state ===
         "failed"
       ) {
-        videoConnected = false;
 
         setStatus(
           "Video connection failed. Reconnecting..."
         );
 
-        scheduleReconnect(300);
+        setTimeout(
+          restartVideo,
+          300
+        );
       }
     };
 
@@ -3906,8 +3866,8 @@ async function createPeerConnection() {
         state ===
         "failed"
       ) {
-        videoConnected = false;
-        scheduleReconnect(500);
+
+        restartVideo();
       }
     };
 
@@ -4185,64 +4145,61 @@ async function flushIce() {
    RESTART VIDEO
 ========================================================= */
 
-function scheduleReconnect(delay = 500) {
-  if (!sessionActive || !connected || !isInitiator) {
-    return;
-  }
-
-  if (reconnectTimer) {
-    return;
-  }
-
-  reconnectTimer = setTimeout(async () => {
-    reconnectTimer = null;
-    await restartVideo();
-  }, delay);
-}
-
-
 async function restartVideo() {
 
-  if (
-    !sessionActive ||
-    !connected ||
-    !isInitiator ||
-    reconnectInProgress
-  ) {
+  if (!connected) {
     return;
   }
 
-  reconnectInProgress = true;
 
   try {
 
     if (!localStream) {
+
       await getLocalMedia();
     }
 
+
     if (!peerConnection) {
+
       await createPeerConnection();
     }
 
-    const offer =
+
+    /*
+      Only caller creates
+      the ICE restart offer.
+    */
+
+    if (isInitiator) {
+
+      const offer =
+        await peerConnection
+          .createOffer({
+
+            iceRestart:
+              true
+
+          });
+
+
       await peerConnection
-        .createOffer({
-          iceRestart: true
-        });
+        .setLocalDescription(
+          offer
+        );
 
-    await peerConnection
-      .setLocalDescription(
-        offer
-      );
 
-    sendSignal({
-      type:
-        "offer",
+      sendSignal({
 
-      sdp:
-        peerConnection
-          .localDescription
-    });
+        type:
+          "offer",
+
+        sdp:
+          peerConnection
+            .localDescription
+
+      });
+    }
 
   } catch (error) {
 
@@ -4250,9 +4207,6 @@ async function restartVideo() {
       "Restart video error:",
       error
     );
-
-  } finally {
-    reconnectInProgress = false;
   }
 }
 
@@ -4264,13 +4218,6 @@ async function restartVideo() {
 function closePeerConnection() {
 
   pendingIce = [];
-  videoConnected = false;
-  reconnectInProgress = false;
-
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
 
 
   if (
