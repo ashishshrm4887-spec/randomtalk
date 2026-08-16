@@ -1439,7 +1439,19 @@ export default {
         request.url
       );
 
-    const adminPassword = env.ADMIN_PASSWORD;
+    /* Supports both a classic plaintext/Secret binding (a string)
+       AND a Secrets Store binding (an object with an async .get()
+       method). Whichever type ADMIN_PASSWORD turns out to be, this
+       resolves it to a plain string. */
+    let adminPassword = env.ADMIN_PASSWORD;
+    if (adminPassword && typeof adminPassword.get === "function") {
+      try {
+        adminPassword = await adminPassword.get();
+      } catch (error) {
+        console.error("Secrets Store read error:", error);
+        adminPassword = undefined;
+      }
+    }
     const adminSessionSecret = env.ADMIN_SESSION_SECRET || adminPassword;
 
     /* =========================
@@ -1455,11 +1467,21 @@ export default {
 
     if (url.pathname === "/admin/debug") {
       const bindingNames = Object.keys(env).sort();
+      const rawAdminPasswordBinding = env.ADMIN_PASSWORD;
+      const bindingType =
+        rawAdminPasswordBinding === undefined
+          ? "missing"
+          : typeof rawAdminPasswordBinding === "string"
+          ? "plain string (classic secret/var)"
+          : typeof rawAdminPasswordBinding === "object" && typeof rawAdminPasswordBinding.get === "function"
+          ? "Secrets Store binding (object with .get())"
+          : "unrecognized type: " + typeof rawAdminPasswordBinding;
       const adminPasswordPresent = typeof adminPassword === "string" && adminPassword.trim().length > 0;
       const adminPasswordLength = adminPasswordPresent ? adminPassword.trim().length : 0;
       return Response.json(
         {
           bindingNamesVisibleToWorker: bindingNames,
+          ADMIN_PASSWORD_bindingType: bindingType,
           ADMIN_PASSWORD_present: adminPasswordPresent,
           ADMIN_PASSWORD_length: adminPasswordLength,
           ADMIN_SESSION_SECRET_present: typeof env.ADMIN_SESSION_SECRET === "string" && env.ADMIN_SESSION_SECRET.trim().length > 0,
