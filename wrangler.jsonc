@@ -10,6 +10,14 @@
         "name": "CHAT",
         "class_name": "ChatRoom"
       }
+       "secrets_store_secrets": [
+  {
+    "binding": "ADMIN_PASSWORD",
+    "store_id": "b1352070fd2b4da592ab114f41225389",
+    "secret_name": "admin_password"
+  }
+],
+
     ]
   },
 
