@@ -1455,43 +1455,6 @@ export default {
     const adminSessionSecret = env.ADMIN_SESSION_SECRET || adminPassword;
 
     /* =========================
-       TEMPORARY DIAGNOSTIC
-       Visit /admin/debug to see
-       exactly what binding names
-       Cloudflare has injected into
-       this Worker at runtime.
-       Never reveals values.
-       REMOVE THIS ROUTE once the
-       ADMIN_PASSWORD issue is fixed.
-    ========================= */
-
-    if (url.pathname === "/admin/debug") {
-      const bindingNames = Object.keys(env).sort();
-      const rawAdminPasswordBinding = env.ADMIN_PASSWORD;
-      const bindingType =
-        rawAdminPasswordBinding === undefined
-          ? "missing"
-          : typeof rawAdminPasswordBinding === "string"
-          ? "plain string (classic secret/var)"
-          : typeof rawAdminPasswordBinding === "object" && typeof rawAdminPasswordBinding.get === "function"
-          ? "Secrets Store binding (object with .get())"
-          : "unrecognized type: " + typeof rawAdminPasswordBinding;
-      const adminPasswordPresent = typeof adminPassword === "string" && adminPassword.trim().length > 0;
-      const adminPasswordLength = adminPasswordPresent ? adminPassword.trim().length : 0;
-      return Response.json(
-        {
-          bindingNamesVisibleToWorker: bindingNames,
-          ADMIN_PASSWORD_bindingType: bindingType,
-          ADMIN_PASSWORD_present: adminPasswordPresent,
-          ADMIN_PASSWORD_length: adminPasswordLength,
-          ADMIN_SESSION_SECRET_present: typeof env.ADMIN_SESSION_SECRET === "string" && env.ADMIN_SESSION_SECRET.trim().length > 0,
-          note: "If ADMIN_PASSWORD_present is false, Cloudflare is not passing that secret into this Worker at runtime, regardless of what the dashboard shows."
-        },
-        { headers: { "cache-control": "no-store" } }
-      );
-    }
-
-    /* =========================
        ADMIN LOGIN / DASHBOARD
     ========================= */
 
