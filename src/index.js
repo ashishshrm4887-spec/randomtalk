@@ -236,34 +236,21 @@ export class ChatRoom extends DurableObject {
 
   async adminStats() {
     const users = [];
-    let sockets = [];
 
-    try {
-      sockets = this.getSockets() || [];
-    } catch (e) {
-      console.error("adminStats getSockets error:", e);
-      sockets = [];
-    }
+    for (const ws of this.getSockets()) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
 
-    for (const ws of sockets) {
-      try {
-        // Count OPEN sockets. Hibernated sockets also report as OPEN in DO API.
-        if (ws.readyState !== WebSocket.OPEN && ws.readyState !== 1) continue;
+      const info = this.getInfo(ws);
 
-        const info = this.getInfo(ws) || {};
-
-        users.push({
-          id: info.id || "unknown",
-          status: info.status || "idle",
-          mode: info.mode || "video",
-          gender: info.gender || "other",
-          country: info.country || "any",
-          partnerId: info.partnerId || null,
-          joinedAt: info.joinedAt || null
-        });
-      } catch (e) {
-        console.error("adminStats user read error:", e);
-      }
+      users.push({
+        id: info.id || "unknown",
+        status: info.status || "idle",
+        mode: info.mode || "video",
+        gender: info.gender || "other",
+        country: info.country || "any",
+        partnerId: info.partnerId || null,
+        joinedAt: info.joinedAt || null
+      });
     }
 
     return {
@@ -271,9 +258,7 @@ export class ChatRoom extends DurableObject {
       waiting: users.filter(u => u.status === "waiting").length,
       matched: users.filter(u => u.status === "matched").length,
       idle: users.filter(u => u.status === "idle").length,
-      users,
-      serverTime: new Date().toISOString(),
-      socketCount: sockets.length
+      users
     };
   }
 
@@ -1397,7 +1382,7 @@ async function verifyAdminSession(request, secret) {
 }
 
 function makeAdminCookie(value, maxAge) {
-  return `${ADMIN_COOKIE}=${value}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`;
+  return `${ADMIN_COOKIE}=${value}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Strict`;
 }
 
 function sameOrigin(request) {
@@ -1435,182 +1420,8 @@ function adminLoginPage(message = "") {
   return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>RandomTalk Admin</title><style>body{margin:0;min-height:100vh;background:#070b16;color:#fff;font-family:system-ui;display:grid;place-items:center}.box{width:min(420px,calc(100% - 32px));background:#101827;border:1px solid #26304a;border-radius:18px;padding:24px;box-sizing:border-box}h1{margin-top:0}input,button{width:100%;box-sizing:border-box;padding:13px;border-radius:10px;font:inherit}input{background:#0b1220;border:1px solid #303b59;color:#fff;margin:12px 0}button{border:0;background:#7c3aed;color:#fff;font-weight:800}.error{color:#fb7185;margin-bottom:10px}</style></head><body><div class="box"><h1>🔐 RandomTalk Admin</h1><p>Administrator access only.</p>${safe ? '<div class="error">' + safe + '</div>' : ""}<form method="post" action="/admin/login"><input type="password" name="password" autocomplete="current-password" placeholder="Admin password" required><button>Sign in</button></form></div></body></html>`;
 }
 
-const ADMIN_PAGE = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>RandomTalk Admin</title><style>
-*{box-sizing:border-box}
-body{margin:0;background:#070b16;color:#fff;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-header{padding:18px 20px;border-bottom:1px solid #26304a;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-header strong{font-size:20px}
-main{max-width:1200px;margin:auto;padding:20px}
-.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.actions button{width:auto}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
-.stat{background:#101827;border:1px solid #26304a;border-radius:14px;padding:18px}
-.label{color:#94a3b8;font-size:13px}
-.number{display:block;margin-top:7px;font-size:30px;font-weight:900}
-.card{background:#101827;border:1px solid #26304a;border-radius:16px;padding:16px;margin-bottom:20px}
-.card h2{margin-top:0}
-.table-wrap{width:100%;overflow-x:auto}
-table{width:100%;border-collapse:collapse;min-width:800px}
-th,td{text-align:left;padding:12px;border-bottom:1px solid #202b42;font-size:13px}
-th{color:#94a3b8}
-.badge{display:inline-block;padding:5px 8px;border-radius:8px;background:#182238;font-size:12px}
-.reports{display:grid;gap:14px}
-.report{background:#0b1220;border:1px solid #26304a;border-radius:14px;padding:16px}
-.meta{color:#94a3b8;font-size:13px;line-height:1.7;margin-top:8px}
-.details{margin:12px 0;white-space:pre-wrap;word-break:break-word}
-.report-actions{display:flex;gap:8px;flex-wrap:wrap}
-.report-actions button,.report-actions select,.actions button{border:1px solid #303b59;background:#182238;color:#fff;border-radius:9px;padding:9px 12px;font-weight:700;cursor:pointer}
-.refresh{background:#7c3aed!important;border-color:#7c3aed!important}
-.danger{background:#35131b!important;color:#fb7185!important}
-.empty{color:#94a3b8;padding:25px 0}
-.hint{color:#94a3b8;font-size:13px;margin:0 0 14px}
-.updated{color:#64748b;font-size:12px}
-@media(max-width:800px){.stats{grid-template-columns:1fr 1fr}main{padding:12px}}
-</style></head><body>
-<header>
-  <strong>💬 RandomTalk Admin</strong>
-  <div class="actions">
-    <span class="updated" id="updated">—</span>
-    <button class="refresh" type="button" onclick="loadAll()">↻ Refresh</button>
-    <form method="post" action="/admin/logout"><button type="submit">Log out</button></form>
-  </div>
-</header>
-<main>
-  <p class="hint">Online = open WebSocket connections to the video room. Camera preview alone does not count — user must press <b>Start</b> and stay connected.</p>
-  <div class="stats">
-    <div class="stat"><span class="label">Online</span><span id="online" class="number">…</span></div>
-    <div class="stat"><span class="label">Waiting</span><span id="waiting" class="number">…</span></div>
-    <div class="stat"><span class="label">Active Chats</span><span id="matched" class="number">…</span></div>
-    <div class="stat"><span class="label">Reports</span><span id="reportTotal" class="number">…</span></div>
-  </div>
-  <div class="card">
-    <h2>👥 Live Users</h2>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>User ID</th><th>Status</th><th>Mode</th><th>Gender</th><th>Country</th><th>Partner</th></tr></thead>
-        <tbody id="users"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-  <div class="card">
-    <h2>⚠ Reports</h2>
-    <div id="reports" class="reports"><div class="empty">Loading reports…</div></div>
-  </div>
-</main>
-<script>
-"use strict";
-const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]));
-
-async function api(path, method = "GET", body = null) {
-  const o = {
-    method,
-    cache: "no-store",
-    credentials: "same-origin",
-    headers: { "Accept": "application/json" }
-  };
-  if (body !== null) {
-    o.headers["content-type"] = "application/json";
-    o.body = JSON.stringify(body);
-  }
-  const r = await fetch(path, o);
-  if (r.status === 401) {
-    location.reload();
-    return null;
-  }
-  if (!r.ok) {
-    let detail = "";
-    try {
-      const j = await r.json();
-      detail = j.error || "";
-    } catch (e1) {
-      try { detail = await r.text(); } catch (e2) {}
-    }
-    throw new Error("Request failed (" + r.status + ")" + (detail ? ": " + detail : ""));
-  }
-  return r.json();
-}
-
-async function loadStats() {
-  const d = await api("/admin/api/stats");
-  if (!d) return;
-  document.getElementById("online").textContent = d.online ?? 0;
-  document.getElementById("waiting").textContent = d.waiting ?? 0;
-  document.getElementById("matched").textContent = d.matched ?? 0;
-  const root = document.getElementById("users");
-  if (d.users && d.users.length) {
-    root.innerHTML = d.users.map(u =>
-      "<tr><td><code>" + esc(u.id) + "</code></td>" +
-      "<td><span class=\\"badge\\">" + esc(u.status) + "</span></td>" +
-      "<td>" + esc(u.mode) + "</td>" +
-      "<td>" + esc(u.gender) + "</td>" +
-      "<td>" + esc(u.country) + "</td>" +
-      "<td><code>" + esc(u.partnerId || "-") + "</code></td></tr>"
-    ).join("");
-  } else {
-    root.innerHTML = "<tr><td colspan=\\"6\\" class=\\"empty\\">No users online. Open the main site on a phone/PC, press <b>Start</b>, and keep the tab open.</td></tr>";
-  }
-  if (d.serverTime) {
-    document.getElementById("updated").textContent = "Updated " + new Date(d.serverTime).toLocaleTimeString();
-  } else {
-    document.getElementById("updated").textContent = "Updated " + new Date().toLocaleTimeString();
-  }
-}
-
-async function loadReports() {
-  const d = await api("/admin/api/reports");
-  if (!d) return;
-  document.getElementById("reportTotal").textContent = Array.isArray(d) ? d.length : 0;
-  const root = document.getElementById("reports");
-  if (Array.isArray(d) && d.length) {
-    root.innerHTML = d.map(r => {
-      const st = r.status || "pending";
-      return "<article class=\\"report\\"><div><b>" + esc(r.reason) + "</b> — <span class=\\"badge\\">" + esc(st) + "</span></div>" +
-        "<div class=\\"meta\\">Created: " + esc(r.createdAt) + "<br>Reporter: <code>" + esc(r.reporterId) + "</code><br>Reported user: <code>" + esc(r.reportedUserId) + "</code><br>Country: " + esc(r.country) + "</div>" +
-        "<div class=\\"details\\">" + esc(r.details || "No details") + "</div>" +
-        "<div class=\\"report-actions\\"><select onchange=\\"setStatus('" + esc(r.id) + "',this.value)\\">" +
-        "<option value=\\"pending\\" " + (st === "pending" ? "selected" : "") + ">Pending</option>" +
-        "<option value=\\"reviewed\\" " + (st === "reviewed" ? "selected" : "") + ">Reviewed</option>" +
-        "<option value=\\"resolved\\" " + (st === "resolved" ? "selected" : "") + ">Resolved</option>" +
-        "</select><button class=\\"danger\\" type=\\"button\\" onclick=\\"removeReport('" + esc(r.id) + "')\\">Delete</button></div></article>";
-    }).join("");
-  } else {
-    root.innerHTML = "<div class=\\"empty\\">No reports yet.</div>";
-  }
-}
-
-async function loadAll() {
-  try {
-    document.getElementById("users").innerHTML = '<tr><td colspan="6" class="empty">Loading…</td></tr>';
-    await Promise.all([loadStats(), loadReports()]);
-  } catch (e) {
-    console.error(e);
-    const msg = esc(e.message || String(e));
-    document.getElementById("online").textContent = "?";
-    document.getElementById("waiting").textContent = "?";
-    document.getElementById("matched").textContent = "?";
-    document.getElementById("reportTotal").textContent = "?";
-    document.getElementById("users").innerHTML = '<tr><td colspan="6" class="empty" style="color:#fb7185">Error: ' + msg + '</td></tr>';
-    document.getElementById("reports").innerHTML = '<div class="empty" style="color:#fb7185">Error: ' + msg + "</div>";
-    document.getElementById("updated").textContent = "Failed";
-  }
-}
-
-async function setStatus(id, status) {
-  await api("/admin/api/report/status", "POST", { id, status });
-  await loadReports();
-}
-
-async function removeReport(id) {
-  if (!confirm("Delete this report permanently?")) return;
-  await api("/admin/api/report/delete", "POST", { id });
-  await loadReports();
-}
-
-loadAll();
-setInterval(loadAll, 5000);
-</script>
-</body></html>`;
-
+const ADMIN_PAGE = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>RandomTalk Admin</title><style>*{box-sizing:border-box}body{margin:0;background:#070b16;color:#fff;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}header{padding:18px 20px;border-bottom:1px solid #26304a;display:flex;justify-content:space-between;align-items:center;gap:12px}header strong{font-size:20px}main{max-width:1200px;margin:auto;padding:20px}.actions{display:flex;gap:8px;align-items:center}.actions button{width:auto}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}.stat{background:#101827;border:1px solid #26304a;border-radius:14px;padding:18px}.label{color:#94a3b8;font-size:13px}.number{display:block;margin-top:7px;font-size:30px;font-weight:900}.card{background:#101827;border:1px solid #26304a;border-radius:16px;padding:16px;margin-bottom:20px}.card h2{margin-top:0}.table-wrap{width:100%;overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:800px}th,td{text-align:left;padding:12px;border-bottom:1px solid #202b42;font-size:13px}th{color:#94a3b8}.badge{display:inline-block;padding:5px 8px;border-radius:8px;background:#182238;font-size:12px}.reports{display:grid;gap:14px}.report{background:#0b1220;border:1px solid #26304a;border-radius:14px;padding:16px}.meta{color:#94a3b8;font-size:13px;line-height:1.7;margin-top:8px}.details{margin:12px 0;white-space:pre-wrap;word-break:break-word}.report-actions{display:flex;gap:8px;flex-wrap:wrap}.report-actions button,.report-actions select,.actions button{border:1px solid #303b59;background:#182238;color:#fff;border-radius:9px;padding:9px 12px;font-weight:700;cursor:pointer}.refresh{background:#7c3aed!important;border-color:#7c3aed!important}.danger{background:#35131b!important;color:#fb7185!important}.empty{color:#94a3b8;padding:25px 0}@media(max-width:800px){.stats{grid-template-columns:1fr 1fr}main{padding:12px}}
+</style></head><body><header><strong>💬 RandomTalk Admin</strong><div class="actions"><button class="refresh" onclick="loadAll()">↻ Refresh</button><form method="post" action="/admin/logout"><button>Log out</button></form></div></header><main><div class="stats"><div class="stat"><span class="label">Online</span><span id="online" class="number">0</span></div><div class="stat"><span class="label">Waiting</span><span id="waiting" class="number">0</span></div><div class="stat"><span class="label">Active Chats</span><span id="matched" class="number">0</span></div><div class="stat"><span class="label">Reports</span><span id="reportTotal" class="number">0</span></div></div><div class="card"><h2>👥 Live Users</h2><div class="table-wrap"><table><thead><tr><th>User ID</th><th>Status</th><th>Mode</th><th>Gender</th><th>Country</th><th>Partner</th></tr></thead><tbody id="users"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody></table></div></div><div class="card"><h2>⚠ Reports</h2><div id="reports" class="reports"><div class="empty">Loading reports...</div></div></div></main><script>"use strict";const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]));async function api(path,method="GET",body=null){const o={method,cache:"no-store"};if(body!==null){o.headers={"content-type":"application/json"};o.body=JSON.stringify(body)}const r=await fetch(path,o);if(r.status===401){location.reload();return null}if(!r.ok){let detail="";try{const j=await r.json();detail=j.error||""}catch(e1){try{detail=await r.text()}catch(e2){}}throw new Error("Request failed ("+r.status+")"+(detail?": "+detail:""))}return r.json()}async function loadStats(){const d=await api("/admin/api/stats");if(!d)return;document.getElementById("online").textContent=d.online;document.getElementById("waiting").textContent=d.waiting;document.getElementById("matched").textContent=d.matched;const root=document.getElementById("users");root.innerHTML=d.users.length?d.users.map(u=>"<tr><td><code>"+esc(u.id)+"</code></td><td><span class=\"badge\">"+esc(u.status)+"</span></td><td>"+esc(u.mode)+"</td><td>"+esc(u.gender)+"</td><td>"+esc(u.country)+"</td><td><code>"+esc(u.partnerId||"-")+"</code></td></tr>").join(""):"<tr><td colspan=\"6\" class=\"empty\">No users online.</td></tr>"}async function loadReports(){const d=await api("/admin/api/reports");if(!d)return;document.getElementById("reportTotal").textContent=d.length;const root=document.getElementById("reports");root.innerHTML=d.length?d.map(r=>{const st=r.status||"pending";return "<article class=\"report\"><div><b>"+esc(r.reason)+"</b> — <span class=\"badge\">"+esc(st)+"</span></div><div class=\"meta\">Created: "+esc(r.createdAt)+"<br>Reporter: <code>"+esc(r.reporterId)+"</code><br>Reported user: <code>"+esc(r.reportedUserId)+"</code><br>Country: "+esc(r.country)+"</div><div class=\"details\">"+esc(r.details||"No details")+"</div><div class=\"report-actions\"><select onchange=\"setStatus('"+esc(r.id)+"',this.value)\"><option value=\"pending\" "+(st==="pending"?"selected":"")+">Pending</option><option value=\"reviewed\" "+(st==="reviewed"?"selected":"")+">Reviewed</option><option value=\"resolved\" "+(st==="resolved"?"selected":"")+">Resolved</option></select><button class=\"danger\" onclick=\"removeReport('"+esc(r.id)+"')\">Delete</button></div></article>"}).join(""):"<div class=\"empty\">No reports yet.</div>"}async function loadAll(){try{await Promise.all([loadStats(),loadReports()])}catch(e){console.error(e);const msg=esc(e.message||String(e));document.getElementById("users").innerHTML='<tr><td colspan="6" class="empty" style="color:#fb7185">Error: '+msg+'</td></tr>';document.getElementById("reports").innerHTML='<div class="empty" style="color:#fb7185">Error: '+msg+'</div>'}}async function setStatus(id,status){await api("/admin/api/report/status","POST",{id,status});await loadReports()}async function removeReport(id){if(!confirm("Delete this report permanently?"))return;await api("/admin/api/report/delete","POST",{id});await loadReports()}loadAll();setInterval(loadAll,10000);</script></body></html>`;
 
 /* =========================================================
    MAIN WORKER
@@ -2316,153 +2127,6 @@ select {
 
 }
 
-
-
-/* =====================================================
-   SNAP-STYLE FILTER CAMERA
-===================================================== */
-
-.filter-page {
-  display: none;
-  position: fixed;
-  inset: 0;
-  z-index: 200;
-  background: #000;
-  flex-direction: column;
-}
-
-.filter-page.show {
-  display: flex;
-}
-
-.filter-stage {
-  position: relative;
-  flex: 1;
-  min-height: 0;
-  background: #000;
-  overflow: hidden;
-}
-
-#filterVideo {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  transform: scaleX(-1);
-  opacity: 0;
-  pointer-events: none;
-}
-
-#filterCanvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  transform: scaleX(-1);
-}
-
-.filter-top-bar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 5;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 16px;
-  padding-top: max(14px, env(safe-area-inset-top));
-  background: linear-gradient(to bottom, rgba(0,0,0,.65), transparent);
-}
-
-.filter-top-bar button {
-  border: 0;
-  border-radius: 999px;
-  padding: 10px 16px;
-  font-weight: 800;
-  font-size: 14px;
-  cursor: pointer;
-  color: #fff;
-  background: rgba(255,255,255,.18);
-  backdrop-filter: blur(8px);
-}
-
-.filter-top-bar .find-btn {
-  background: linear-gradient(90deg, #d946ef, #7c3aed);
-}
-
-.filter-bottom {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 5;
-  padding: 12px 0 max(20px, env(safe-area-inset-bottom));
-  background: linear-gradient(to top, rgba(0,0,0,.75), transparent);
-}
-
-.filter-hint {
-  text-align: center;
-  color: rgba(255,255,255,.85);
-  font-size: 13px;
-  margin-bottom: 10px;
-  font-weight: 600;
-}
-
-.filter-strip {
-  display: flex;
-  gap: 12px;
-  overflow-x: auto;
-  padding: 4px 16px 8px;
-  scroll-snap-type: x mandatory;
-  -webkit-overflow-scrolling: touch;
-}
-
-.filter-strip::-webkit-scrollbar { display: none; }
-
-.filter-item {
-  flex: 0 0 auto;
-  width: 72px;
-  scroll-snap-align: center;
-  border: 0;
-  background: transparent;
-  color: #fff;
-  cursor: pointer;
-  padding: 0;
-  text-align: center;
-}
-
-.filter-item .preview {
-  width: 64px;
-  height: 64px;
-  border-radius: 50%;
-  border: 3px solid rgba(255,255,255,.35);
-  display: grid;
-  place-items: center;
-  font-size: 28px;
-  margin: 0 auto 6px;
-  background: rgba(255,255,255,.12);
-  transition: border-color .15s, transform .15s;
-}
-
-.filter-item.active .preview {
-  border-color: #d946ef;
-  transform: scale(1.08);
-  box-shadow: 0 0 0 2px rgba(217,70,239,.35);
-}
-
-.filter-item span.name {
-  display: block;
-  font-size: 11px;
-  font-weight: 700;
-  opacity: .9;
-}
-
-body.filter-open {
-  overflow: hidden;
-}
 
 /* =====================================================
    MESSAGE OVERLAY
@@ -3173,28 +2837,6 @@ Safety
 </main>
 
 
-
-<!-- =====================================================
-     SNAP-STYLE FILTER CAMERA PAGE
-===================================================== -->
-
-<div id="filterPage" class="filter-page" aria-hidden="true">
-  <div class="filter-stage">
-    <video id="filterVideo" playsinline muted autoplay></video>
-    <canvas id="filterCanvas"></canvas>
-
-    <div class="filter-top-bar">
-      <button type="button" id="closeFilterBtn" aria-label="Close">✕ Close</button>
-      <button type="button" id="findStrangerBtn" class="find-btn">🚀 Find Stranger</button>
-    </div>
-
-    <div class="filter-bottom">
-      <div class="filter-hint">Pick a fun filter, then find someone to chat</div>
-      <div class="filter-strip" id="filterStrip"></div>
-    </div>
-  </div>
-</div>
-
 <!-- =====================================================
      REPORT MODAL
 ===================================================== -->
@@ -3813,36 +3455,21 @@ async function handleMessage(
 ========================================================= */
 
 function startChat() {
-  /* Open Snap-style filter camera first; matching starts from Find Stranger */
-  openFilterCamera();
-}
 
-async function beginMatching() {
   manualClose = false;
 
-  try {
-    await ensureFilteredStream();
-  } catch (e) {
-    setStatus("Camera error: " + (e.message || e));
-    return;
-  }
-
-  /* Prefer filtered stream for WebRTC */
-  if (filteredStream) {
-    localStream = filteredStream;
-    if (localVideo) {
-      localVideo.srcObject = filteredStream;
-    }
-  }
 
   if (
     !socket ||
     socket.readyState !==
     WebSocket.OPEN
   ) {
+
     connectSocket();
+
     return;
   }
+
 
   joinRoom();
 }
@@ -3980,12 +3607,8 @@ function updateButtons() {
 
 async function getLocalMedia() {
 
-  if (rawVideoStream && rawVideoStream.getTracks().some(t => t.readyState === "live")) {
-    if (!localStream) localStream = rawVideoStream;
-    return localStream;
-  }
+  if (localStream) {
 
-  if (localStream && localStream.getTracks().some(t => t.readyState === "live")) {
     return localStream;
   }
 
@@ -4039,8 +3662,6 @@ async function getLocalMedia() {
 
       });
 
-  rawVideoStream = localStream;
-
 
   localVideo.srcObject =
     localStream;
@@ -4056,12 +3677,6 @@ async function getLocalMedia() {
       () => {}
     );
 
-  const fv = document.getElementById("filterVideo");
-  if (fv) {
-    fv.srcObject = localStream;
-    fv.muted = true;
-    await fv.play().catch(() => {});
-  }
 
   cameraEnabled =
     true;
@@ -4300,15 +3915,6 @@ async function createPeerConnection() {
 async function startVideo() {
 
   await getLocalMedia();
-  try {
-    await ensureFilteredStream();
-    if (filteredStream) {
-      localStream = filteredStream;
-      if (localVideo) localVideo.srcObject = filteredStream;
-    }
-  } catch (e) {
-    console.warn("filter stream fallback", e);
-  }
 
 
   await createPeerConnection();
@@ -5016,283 +4622,12 @@ function submitReport() {
 }
 
 
-
-/* =========================================================
-   SNAP-STYLE FILTER CAMERA
-========================================================= */
-
-const FILTERS = [
-  { id: "normal", name: "Normal", emoji: "😊" },
-  { id: "smooth", name: "Smooth", emoji: "✨" },
-  { id: "warm", name: "Warm", emoji: "🌅" },
-  { id: "cool", name: "Cool", emoji: "❄️" },
-  { id: "vivid", name: "Vivid", emoji: "🌈" },
-  { id: "glow", name: "Glow", emoji: "🌟" },
-  { id: "mono", name: "B&W", emoji: "⬛" },
-  { id: "film", name: "Film", emoji: "📷" },
-  { id: "pink", name: "Pink", emoji: "💗" },
-  { id: "dog", name: "Dog", emoji: "🐶" },
-  { id: "cat", name: "Cat", emoji: "🐱" },
-  { id: "crown", name: "Crown", emoji: "👑" },
-  { id: "hearts", name: "Hearts", emoji: "😍" },
-  { id: "shades", name: "Shades", emoji: "🕶️" },
-  { id: "party", name: "Party", emoji: "🎉" }
-];
-
-let currentFilterId = "normal";
-let filterAnimId = null;
-let filteredStream = null;
-let filterCanvasStream = null;
-let rawVideoStream = null;
-
-function buildFilterStrip() {
-  const strip = document.getElementById("filterStrip");
-  if (!strip || strip.dataset.ready === "1") return;
-  strip.innerHTML = FILTERS.map(f =>
-    '<button type="button" class="filter-item' + (f.id === currentFilterId ? " active" : "") + '" data-filter="' + f.id + '">' +
-    '<div class="preview">' + f.emoji + '</div><span class="name">' + f.name + '</span></button>'
-  ).join("");
-  strip.dataset.ready = "1";
-  strip.onclick = (e) => {
-    const btn = e.target.closest(".filter-item");
-    if (!btn) return;
-    currentFilterId = btn.getAttribute("data-filter") || "normal";
-    strip.querySelectorAll(".filter-item").forEach(el => {
-      el.classList.toggle("active", el.getAttribute("data-filter") === currentFilterId);
-    });
-  };
-}
-
-function applyPixelFilter(ctx, w, h, id) {
-  if (id === "normal" || id === "dog" || id === "cat" || id === "crown" || id === "hearts" || id === "shades" || id === "party") {
-    return;
-  }
-  const img = ctx.getImageData(0, 0, w, h);
-  const d = img.data;
-  for (let i = 0; i < d.length; i += 4) {
-    let r = d[i], g = d[i + 1], b = d[i + 2];
-    if (id === "warm") {
-      r = Math.min(255, r * 1.12 + 12);
-      b = b * 0.88;
-    } else if (id === "cool") {
-      b = Math.min(255, b * 1.12 + 10);
-      r = r * 0.9;
-    } else if (id === "vivid") {
-      r = Math.min(255, (r - 128) * 1.35 + 128);
-      g = Math.min(255, (g - 128) * 1.35 + 128);
-      b = Math.min(255, (b - 128) * 1.35 + 128);
-    } else if (id === "mono") {
-      const y = 0.299 * r + 0.587 * g + 0.114 * b;
-      r = g = b = y;
-    } else if (id === "film") {
-      const y = 0.299 * r + 0.587 * g + 0.114 * b;
-      r = Math.min(255, y * 1.05 + 30);
-      g = Math.min(255, y * 0.95 + 15);
-      b = Math.min(255, y * 0.75);
-    } else if (id === "pink") {
-      r = Math.min(255, r * 1.08 + 20);
-      g = g * 0.92;
-      b = Math.min(255, b * 1.05 + 15);
-    } else if (id === "smooth" || id === "glow") {
-      r = Math.min(255, r * 1.06 + 8);
-      g = Math.min(255, g * 1.04 + 6);
-      b = Math.min(255, b * 1.04 + 6);
-    }
-    d[i] = r; d[i + 1] = g; d[i + 2] = b;
-  }
-  ctx.putImageData(img, 0, 0);
-
-  if (id === "glow" || id === "smooth") {
-    ctx.save();
-    ctx.globalAlpha = id === "glow" ? 0.22 : 0.12;
-    ctx.filter = "blur(6px)";
-    ctx.drawImage(ctx.canvas, 0, 0);
-    ctx.restore();
-    ctx.filter = "none";
-  }
-}
-
-function drawStickerOverlay(ctx, w, h, id) {
-  const cx = w * 0.5;
-  const faceY = h * 0.38;
-  const faceW = Math.min(w, h) * 0.42;
-  ctx.save();
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-
-  if (id === "dog") {
-    ctx.font = (faceW * 0.5) + "px serif";
-    ctx.fillText("👂", cx - faceW * 0.45, faceY - faceW * 0.38);
-    ctx.fillText("👂", cx + faceW * 0.45, faceY - faceW * 0.38);
-    ctx.font = (faceW * 0.42) + "px serif";
-    ctx.fillText("🐶", cx, faceY + faceW * 0.02);
-  } else if (id === "cat") {
-    ctx.font = (faceW * 0.5) + "px serif";
-    ctx.fillText("🐱", cx, faceY - faceW * 0.05);
-  } else if (id === "crown") {
-    ctx.font = (faceW * 0.55) + "px serif";
-    ctx.fillText("👑", cx, faceY - faceW * 0.55);
-  } else if (id === "hearts") {
-    ctx.font = (faceW * 0.32) + "px serif";
-    ctx.fillText("😍", cx, faceY);
-    ctx.font = (faceW * 0.22) + "px serif";
-    ctx.fillText("💕", cx - faceW * 0.55, faceY - faceW * 0.2);
-    ctx.fillText("💕", cx + faceW * 0.55, faceY - faceW * 0.2);
-  } else if (id === "shades") {
-    ctx.font = (faceW * 0.5) + "px serif";
-    ctx.fillText("🕶️", cx, faceY - faceW * 0.05);
-  } else if (id === "party") {
-    ctx.font = (faceW * 0.28) + "px serif";
-    ctx.fillText("🎉", cx - faceW * 0.5, faceY - faceW * 0.5);
-    ctx.fillText("🥳", cx, faceY);
-    ctx.fillText("🎊", cx + faceW * 0.5, faceY - faceW * 0.5);
-  }
-  ctx.restore();
-}
-
-function filterLoop() {
-  const video = document.getElementById("filterVideo");
-  const canvas = document.getElementById("filterCanvas");
-  if (!video || !canvas) return;
-
-  const w = video.videoWidth || 640;
-  const h = video.videoHeight || 480;
-  if (canvas.width !== w || canvas.height !== h) {
-    canvas.width = w;
-    canvas.height = h;
-  }
-
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (video.readyState >= 2) {
-    ctx.drawImage(video, 0, 0, w, h);
-    applyPixelFilter(ctx, w, h, currentFilterId);
-    drawStickerOverlay(ctx, w, h, currentFilterId);
-  }
-
-  filterAnimId = requestAnimationFrame(filterLoop);
-}
-
-function stopFilterLoop() {
-  if (filterAnimId) {
-    cancelAnimationFrame(filterAnimId);
-    filterAnimId = null;
-  }
-}
-
-async function openFilterCamera() {
-  buildFilterStrip();
-  const page = document.getElementById("filterPage");
-  if (!page) {
-    beginMatching();
-    return;
-  }
-
-  try {
-    setStatus("Opening camera…");
-    rawVideoStream = await getLocalMedia();
-    const fv = document.getElementById("filterVideo");
-    if (fv) {
-      fv.srcObject = rawVideoStream;
-      await fv.play().catch(() => {});
-    }
-    page.classList.add("show");
-    page.setAttribute("aria-hidden", "false");
-    document.body.classList.add("filter-open");
-    stopFilterLoop();
-    filterLoop();
-    setStatus("Pick a filter, then tap Find Stranger");
-  } catch (e) {
-    console.error(e);
-    setStatus("Camera permission needed to continue");
-    alert("Please allow camera & microphone access to use filters and video chat.");
-  }
-}
-
-function closeFilterCamera(keepStream) {
-  const page = document.getElementById("filterPage");
-  if (page) {
-    page.classList.remove("show");
-    page.setAttribute("aria-hidden", "true");
-  }
-  document.body.classList.remove("filter-open");
-  if (!keepStream) {
-    stopFilterLoop();
-  }
-}
-
-async function ensureFilteredStream() {
-  const canvas = document.getElementById("filterCanvas");
-  const video = document.getElementById("filterVideo");
-
-  if (!rawVideoStream) {
-    rawVideoStream = await getLocalMedia();
-  }
-
-  if (!canvas || !video) {
-    filteredStream = rawVideoStream;
-    return filteredStream;
-  }
-
-  if (video.readyState < 2) {
-    await new Promise(resolve => {
-      const t = setTimeout(resolve, 1500);
-      video.onloadeddata = () => { clearTimeout(t); resolve(); };
-    });
-  }
-
-  if (!filterAnimId) filterLoop();
-
-  if (!filterCanvasStream) {
-    filterCanvasStream = canvas.captureStream(30);
-  }
-
-  const audioTracks = rawVideoStream.getAudioTracks();
-  const videoTracks = filterCanvasStream.getVideoTracks();
-  filteredStream = new MediaStream([
-    ...videoTracks,
-    ...audioTracks
-  ]);
-
-  return filteredStream;
-}
-
-
 /* =========================================================
    EVENTS
 ========================================================= */
 
 startBtn.onclick =
   startChat;
-
-
-const findStrangerBtn = document.getElementById("findStrangerBtn");
-if (findStrangerBtn) {
-  findStrangerBtn.onclick = async () => {
-    findStrangerBtn.disabled = true;
-    findStrangerBtn.textContent = "Starting…";
-    try {
-      await beginMatching();
-      closeFilterCamera(true);
-      const videoCard = document.getElementById("videoCard");
-      if (videoCard) videoCard.style.display = "";
-      setStatus("Connecting…");
-    } catch (e) {
-      console.error(e);
-      setStatus("Could not start: " + (e.message || e));
-    } finally {
-      findStrangerBtn.disabled = false;
-      findStrangerBtn.textContent = "🚀 Find Stranger";
-    }
-  };
-}
-
-const closeFilterBtn = document.getElementById("closeFilterBtn");
-if (closeFilterBtn) {
-  closeFilterBtn.onclick = () => {
-    closeFilterCamera(false);
-    setStatus("● Ready — press Start Video Chat");
-  };
-}
 
 
 nextBtn.onclick =
